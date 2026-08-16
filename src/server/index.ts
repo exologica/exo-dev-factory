@@ -16,6 +16,9 @@ const ANTHROPIC_API_VERSION = '2023-06-01'
 // Google Gemini API constants
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
 
+// Cohere API constants
+const COHERE_URL = 'https://api.cohere.com/v1/chat'
+
 // Durable by default: traces survive restarts in a local SQLite file. The
 // location is deterministic and documented (README); override with
 // TRACE_DB_PATH, or pass ':memory:' for a throwaway in-memory database.
@@ -446,6 +449,113 @@ app.post('/v1/proxy/gemini/generateContent', async (c) => {
         attributes: {
           'llm.model': modelName,
           'proxy.upstream': 'google',
+          'http.status': response.status
+        },
+        usage: {
+          promptTokens,
+          completionTokens,
+          totalCost
+        }
+      }
+    ]
+  }
+
+  store.add(trace)
+
+  return new Response(JSON.stringify(responseBody), {
+    status: response.status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  })
+})
+
+app.post('/v1/proxy/cohere/v1/chat', async (c) => {
+  const authHeader = c.req.header('authorization')
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'missing or invalid Authorization header' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const startTime = new Date().toISOString()
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: authHeader
+    },
+    body: JSON.stringify(body)
+  }
+
+  let response: Response
+  try {
+    response = await fetch(COHERE_URL, requestInit)
+  } catch (err) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-cohere-chat',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': err instanceof Error ? err.message : 'unknown error',
+            'proxy.upstream': 'cohere'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream request failed' }, 502)
+  }
+
+  const endTime = new Date().toISOString()
+  const responseBody = (await response.clone().json().catch(() => ({}))) as {
+    text?: string
+    generationId?: string
+    meta?: {
+      tokens?: {
+        inputTokens?: number
+        outputTokens?: number
+      }
+    }
+    model?: string
+  }
+
+  const requestModel = typeof body.model === 'string' ? body.model : undefined
+  const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
+  const model = response.ok
+    ? (responseModel ?? requestModel ?? 'command-r-plus')
+    : 'unknown'
+  const promptTokens = typeof responseBody.meta?.tokens?.inputTokens === 'number' ? responseBody.meta.tokens.inputTokens : 0
+  const completionTokens = typeof responseBody.meta?.tokens?.outputTokens === 'number' ? responseBody.meta.tokens.outputTokens : 0
+
+  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+  const totalCost = totalCostCents / 100
+
+  const trace: Trace = {
+    name: 'proxy-cohere-chat',
+    startTime,
+    endTime,
+    spans: [
+      {
+        id: crypto.randomUUID(),
+        name: 'llm-call',
+        startTime,
+        endTime,
+        status: response.ok ? 'ok' : 'error',
+        attributes: {
+          'llm.model': model,
+          'proxy.upstream': 'cohere',
           'http.status': response.status
         },
         usage: {
