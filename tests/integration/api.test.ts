@@ -546,6 +546,173 @@ describe('OpenAI chat completions proxy', () => {
   })
 })
 
+describe('Anthropic chat completions proxy', () => {
+  const mockAnthropicResponse = {
+    id: 'msg_test',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Hello!' }],
+    model: 'claude-3-5-sonnet-20241022',
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: 12, output_tokens: 8 }
+  }
+
+  const mockErrorResponse = {
+    type: 'error',
+    error: { type: 'rate_limit_error', message: 'Rate limit exceeded' }
+  }
+
+  const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
+  const originalFetch = global.fetch
+
+  function makeAnthropicProxyRequest(body: unknown, apiKey = 'test-key', useAuthHeader = false) {
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    if (useAuthHeader) {
+      headers.authorization = `Bearer ${apiKey}`
+    } else {
+      headers['x-api-key'] = apiKey
+    }
+    return fetch(`${baseUrl}/v1/proxy/anthropic/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    })
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === ANTHROPIC_URL) {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockAnthropicResponse) }),
+          json: () => Promise.resolve(mockAnthropicResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns 401 when x-api-key header is missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/anthropic/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-3-5-sonnet-20241022', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(401)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing or invalid x-api-key header')
+  })
+
+  it('accepts Authorization header as fallback for x-api-key', async () => {
+    const res = await makeAnthropicProxyRequest(
+      { model: 'claude-3-5-sonnet-20241022', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] },
+      'test-key',
+      true
+    )
+    expect(res.status).toBe(200)
+  })
+
+  it('returns 400 for invalid JSON body', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/anthropic/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test-key' },
+      body: '{not json'
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid JSON body')
+  })
+
+  it('forwards request to Anthropic and returns response with trace on success', async () => {
+    const res = await makeAnthropicProxyRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockAnthropicResponse)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('claude-3-5-sonnet-20241022')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('anthropic')
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(12)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(8)
+    expect(typeof proxyTrace?.spans[0]?.usage?.totalCost).toBe('number')
+    // Anthropic sonnet: $3.00/1M input, $15.00/1M output
+    // 12 * 300/1M = 0.0036 cents, 8 * 1500/1M = 0.012 cents
+    // Rounds to 0 cents for small token counts - use >= 0
+    expect(proxyTrace?.spans[0]?.usage?.totalCost).toBeGreaterThanOrEqual(0)
+
+    // Security: API key must not be in trace
+    expect(proxyTrace?.spans[0]?.attributes?.['x-api-key']).toBeUndefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['authorization']).toBeUndefined()
+  })
+
+  it('creates error trace when upstream fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === ANTHROPIC_URL) {
+        return {
+          ok: false,
+          status: 429,
+          clone: () => ({ json: () => Promise.resolve(mockErrorResponse) }),
+          json: () => Promise.resolve(mockErrorResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeAnthropicProxyRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    expect(res.status).toBe(429)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('anthropic')
+    expect(errorTrace?.spans[0]?.attributes?.['http.status']).toBe(429)
+  })
+
+  it('creates error trace when network request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === ANTHROPIC_URL) {
+        throw new Error('ENOTFOUND')
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeAnthropicProxyRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    expect(res.status).toBe(502)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
+  })
+})
+
 describe('cost aggregation API', () => {
   function seedTraceWithUsage(
     name: string,
