@@ -35,6 +35,17 @@ pnpm start   # http://localhost:8787
 | `pnpm smoke` | Boot built server and assert the API contract |
 | `pnpm start` | Run the built server |
 
+## Configuration
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `PORT` | No | `8787` | HTTP port the server binds |
+| `TRACE_DB_PATH` | No | `data/traces.db` | SQLite database file for durable trace storage. Relative paths resolve from the working directory; set to `:memory:` for a throwaway in-memory database |
+
+Traces persist across server restarts in the SQLite database file (default
+`data/traces.db`, gitignored). The store initializes its schema idempotently
+and uses strictly parameterized queries for all reads and writes.
+
 ## Security
 
 Report vulnerabilities privately via

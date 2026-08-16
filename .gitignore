@@ -6,6 +6,9 @@ dist/
 dist-server/
 dist-client/
 
+# Runtime SQLite database (default TRACE_DB_PATH target)
+data/
+
 # Environment / secrets
 .env
 .env.*
