@@ -18,6 +18,10 @@ export interface TraceListOptions {
   offset?: number
   /** Only return traces whose derived status matches. */
   status?: TraceStatus
+  /** Only return traces with this sessionId. */
+  sessionId?: string
+  /** Only return traces with this userId. */
+  userId?: string
 }
 
 /**
@@ -41,10 +45,13 @@ export class TraceStore {
         endTime      TEXT NOT NULL,
         startEpochMs INTEGER NOT NULL,
         status       TEXT NOT NULL DEFAULT 'ok',
+        sessionId    TEXT,
+        userId       TEXT,
         data         TEXT NOT NULL
       )
     `)
     this.ensureStatusColumn()
+    this.ensureSessionColumns()
   }
 
   /**
@@ -63,18 +70,36 @@ export class TraceStore {
     }
   }
 
+  /**
+   * Idempotent migration: adds sessionId and userId columns for session
+   * grouping. Creates indexes to support efficient filtering.
+   */
+  private ensureSessionColumns(): void {
+    const columns = this.db.prepare('PRAGMA table_info(traces)').all() as Array<{ name: string }>
+    if (!columns.some((c) => c.name === 'sessionId')) {
+      this.db.exec('ALTER TABLE traces ADD COLUMN sessionId TEXT')
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_traces_sessionId ON traces(sessionId)')
+    }
+    if (!columns.some((c) => c.name === 'userId')) {
+      this.db.exec('ALTER TABLE traces ADD COLUMN userId TEXT')
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_traces_userId ON traces(userId)')
+    }
+  }
+
   add(trace: Trace): string {
     const id = trace.id ?? crypto.randomUUID()
     this.db
       .prepare(
-        `INSERT INTO traces (id, name, startTime, endTime, startEpochMs, status, data)
-         VALUES (@id, @name, @startTime, @endTime, @startEpochMs, @status, @data)
+        `INSERT INTO traces (id, name, startTime, endTime, startEpochMs, status, sessionId, userId, data)
+         VALUES (@id, @name, @startTime, @endTime, @startEpochMs, @status, @sessionId, @userId, @data)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            startTime = excluded.startTime,
            endTime = excluded.endTime,
            startEpochMs = excluded.startEpochMs,
            status = excluded.status,
+           sessionId = excluded.sessionId,
+           userId = excluded.userId,
            data = excluded.data`
       )
       .run({
@@ -84,6 +109,8 @@ export class TraceStore {
         endTime: trace.endTime,
         startEpochMs: Date.parse(trace.startTime),
         status: traceStatus(trace),
+        sessionId: trace.sessionId ?? null,
+        userId: trace.userId ?? null,
         data: JSON.stringify({ ...trace, id })
       })
     return id
@@ -101,6 +128,14 @@ export class TraceStore {
     if (options.status !== undefined) {
       where.push('status = ?')
       params.push(options.status)
+    }
+    if (options.sessionId !== undefined) {
+      where.push('sessionId = ?')
+      params.push(options.sessionId)
+    }
+    if (options.userId !== undefined) {
+      where.push('userId = ?')
+      params.push(options.userId)
     }
     const whereClause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
     let sql = `SELECT data FROM traces${whereClause} ORDER BY startEpochMs DESC, rowid DESC`

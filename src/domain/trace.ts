@@ -18,13 +18,18 @@ export const spanSchema = z.object({
   usage: usageSchema
 })
 
+const sessionIdSchema = z.string().min(1).max(128).optional()
+const userIdSchema = z.string().min(1).max(128).optional()
+
 export const traceSchema = z
   .object({
     id: z.string().min(1).optional(),
     name: z.string().min(1),
     startTime: z.string().datetime({ offset: true }),
     endTime: z.string().datetime({ offset: true }),
-    spans: z.array(spanSchema).min(1)
+    spans: z.array(spanSchema).min(1),
+    sessionId: sessionIdSchema,
+    userId: userIdSchema
   })
   .refine((t) => Date.parse(t.endTime) >= Date.parse(t.startTime), {
     message: 'endTime must be >= startTime',
