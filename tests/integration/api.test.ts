@@ -545,3 +545,174 @@ describe('OpenAI chat completions proxy', () => {
     expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
   })
 })
+
+describe('cost aggregation API', () => {
+  function seedTraceWithUsage(
+    name: string,
+    usage: { promptTokens: number; completionTokens: number },
+    model = 'gpt-4o',
+    sessionId?: string
+  ): Promise<string> {
+    return fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        startTime: new Date().toISOString(),
+        endTime: new Date(Date.now() + 1000).toISOString(),
+        sessionId,
+        spans: [
+          {
+            id: `span-${name}`,
+            name: 'llm-call',
+            startTime: new Date().toISOString(),
+            endTime: new Date(Date.now() + 500).toISOString(),
+            status: 'ok',
+            usage,
+            attributes: { 'llm.model': model }
+          }
+        ]
+      })
+    }).then(async (res) => {
+      const body = (await res.json()) as { id: string }
+      return body.id
+    })
+  }
+
+  it('returns 404 for unknown trace cost', async () => {
+    const res = await fetch(`${baseUrl}/api/traces/no-such-id/cost`)
+    expect(res.status).toBe(404)
+  })
+
+  it('returns cost breakdown for a trace with usage', async () => {
+    const id = await seedTraceWithUsage('cost-trace', { promptTokens: 1_000_000, completionTokens: 500_000 }, 'gpt-4o')
+    const res = await fetch(`${baseUrl}/api/traces/${id}/cost`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      traceId: string
+      promptTokens: number
+      completionTokens: number
+      totalCostCents: number
+      totalCostDollars: number
+    }
+    expect(body.traceId).toBe(id)
+    expect(body.promptTokens).toBe(1_000_000)
+    expect(body.completionTokens).toBe(500_000)
+    // gpt-4o: $2.50/1M input, $10.00/1M output
+    // 1M * 250/1M = 250 cents, 500K * 1000/1M = 500 cents = 750 cents
+    expect(body.totalCostCents).toBe(750)
+    expect(body.totalCostDollars).toBe(7.50)
+  })
+
+  it('returns zero cost for trace without usage', async () => {
+    const res = await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'no-usage-trace',
+        startTime: '2026-08-16T10:00:00.000Z',
+        endTime: '2026-08-16T10:00:01.000Z',
+        spans: [
+          {
+            id: 'span-no-usage',
+            name: 'parse',
+            startTime: '2026-08-16T10:00:00.000Z',
+            endTime: '2026-08-16T10:00:00.500Z',
+            status: 'ok'
+          }
+        ]
+      })
+    })
+    const { id } = (await res.json()) as { id: string }
+
+    const costRes = await fetch(`${baseUrl}/api/traces/${id}/cost`)
+    expect(costRes.status).toBe(200)
+    const body = (await costRes.json()) as { totalCostCents: number; totalCostDollars: number }
+    expect(body.totalCostCents).toBe(0)
+    expect(body.totalCostDollars).toBe(0)
+  })
+
+  it('aggregates cost for a session', async () => {
+    await seedTraceWithUsage('session-trace-1', { promptTokens: 1_000_000, completionTokens: 500_000 }, 'gpt-4o', 'session-cost-1')
+    await seedTraceWithUsage('session-trace-2', { promptTokens: 500_000, completionTokens: 250_000 }, 'gpt-4o', 'session-cost-1')
+    await seedTraceWithUsage('session-trace-3', { promptTokens: 2_000_000, completionTokens: 1_000_000 }, 'gpt-4o', 'session-cost-2')
+
+    const res = await fetch(`${baseUrl}/api/sessions/session-cost-1/cost`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      sessionId: string
+      traceCount: number
+      promptTokens: number
+      completionTokens: number
+      totalCostCents: number
+      totalCostDollars: number
+    }
+    expect(body.sessionId).toBe('session-cost-1')
+    expect(body.traceCount).toBe(2)
+    expect(body.promptTokens).toBe(1_500_000)
+    expect(body.completionTokens).toBe(750_000)
+    // trace-1: 750 cents, trace-2: 375 cents = 1125 cents
+    expect(body.totalCostCents).toBe(1125)
+    expect(body.totalCostDollars).toBe(11.25)
+  })
+
+  it('returns zero for empty session', async () => {
+    const res = await fetch(`${baseUrl}/api/sessions/empty-session/cost`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { traceCount: number; totalCostCents: number }
+    expect(body.traceCount).toBe(0)
+    expect(body.totalCostCents).toBe(0)
+  })
+
+  it('returns 400 for invalid sessionId', async () => {
+    const res = await fetch(`${baseUrl}/api/sessions/${'a'.repeat(129)}/cost`)
+    expect(res.status).toBe(400)
+  })
+
+  it('aggregates cost over time window', async () => {
+    // These traces will be within the default 24h window
+    await seedTraceWithUsage('window-trace-1', { promptTokens: 1_000_000, completionTokens: 500_000 }, 'gpt-4o')
+    await seedTraceWithUsage('window-trace-2', { promptTokens: 500_000, completionTokens: 250_000 }, 'gpt-4o')
+
+    const res = await fetch(`${baseUrl}/api/cost/summary?window=24`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      windowHours: number
+      traceCount: number
+      promptTokens: number
+      completionTokens: number
+      totalCostCents: number
+      totalCostDollars: number
+    }
+    expect(body.windowHours).toBe(24)
+    expect(body.traceCount).toBeGreaterThanOrEqual(2)
+    expect(body.promptTokens).toBeGreaterThanOrEqual(1_500_000)
+    expect(body.completionTokens).toBeGreaterThanOrEqual(750_000)
+    expect(body.totalCostCents).toBeGreaterThanOrEqual(1125)
+  })
+
+  it('clamps window to maximum', async () => {
+    const res = await fetch(`${baseUrl}/api/cost/summary?window=99999`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { windowHours: number }
+    expect(body.windowHours).toBe(8760) // 1 year max
+  })
+
+  it('uses default window when not specified', async () => {
+    const res = await fetch(`${baseUrl}/api/cost/summary`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { windowHours: number }
+    expect(body.windowHours).toBe(24)
+  })
+
+  it('handles different models in cost aggregation', async () => {
+    await seedTraceWithUsage('gpt4o-trace', { promptTokens: 1_000_000, completionTokens: 1_000_000 }, 'gpt-4o')
+    await seedTraceWithUsage('claude-trace', { promptTokens: 1_000_000, completionTokens: 1_000_000 }, 'claude-3-5-sonnet-20241022')
+
+    const res = await fetch(`${baseUrl}/api/cost/summary?window=24`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { totalCostCents: number }
+    // gpt-4o: 1250 cents, claude: 1800 cents = 3050 cents
+    expect(body.totalCostCents).toBeGreaterThanOrEqual(3050)
+  })
+})
