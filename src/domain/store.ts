@@ -1,7 +1,8 @@
 import Database from 'better-sqlite3'
 // Global Web Crypto (Node 20+): crypto.randomUUID() — no import needed
 import type { Trace, TraceStatus } from './trace.js'
-import { traceStatus } from './trace.js'
+import { traceStatus, traceTotalPromptTokens, traceTotalCompletionTokens } from './trace.js'
+import { pricingEngine } from './pricing.js'
 
 export interface TraceStoreOptions {
   /**
@@ -266,5 +267,103 @@ export class TraceStore {
   /** Close the underlying SQLite database. Safe to call once, after which the store is unusable. */
   close(): void {
     this.db.close()
+  }
+
+  /**
+   * Calculate aggregated cost for a single trace by id.
+   * Returns cost in cents (integer) and dollars (float), plus token breakdown.
+   */
+  getTraceCost(id: string): { traceId: string; promptTokens: number; completionTokens: number; totalCostCents: number; totalCostDollars: number } | undefined {
+    const trace = this.get(id)
+    if (!trace) return undefined
+
+    let promptTokens = 0
+    let completionTokens = 0
+    let totalCostCents = 0
+
+    for (const span of trace.spans) {
+      if (span.usage) {
+        promptTokens += span.usage.promptTokens ?? 0
+        completionTokens += span.usage.completionTokens ?? 0
+        // Use model from span attributes if available, otherwise default
+        const model = (span.attributes?.['llm.model'] as string) ?? 'gpt-4o'
+        totalCostCents += pricingEngine.calculateCostCents(span.usage.promptTokens ?? 0, span.usage.completionTokens ?? 0, model)
+      }
+    }
+
+    return {
+      traceId: id,
+      promptTokens,
+      completionTokens,
+      totalCostCents,
+      totalCostDollars: totalCostCents / 100
+    }
+  }
+
+  /**
+   * Calculate aggregated cost for all traces in a session.
+   * Returns cost in cents (integer) and dollars (float), plus token breakdown and trace count.
+   */
+  getSessionCost(sessionId: string): { sessionId: string; traceCount: number; promptTokens: number; completionTokens: number; totalCostCents: number; totalCostDollars: number } {
+    const traces = this.list({ sessionId })
+    let promptTokens = 0
+    let completionTokens = 0
+    let totalCostCents = 0
+
+    for (const trace of traces) {
+      for (const span of trace.spans) {
+        if (span.usage) {
+          promptTokens += span.usage.promptTokens ?? 0
+          completionTokens += span.usage.completionTokens ?? 0
+          const model = (span.attributes?.['llm.model'] as string) ?? 'gpt-4o'
+          totalCostCents += pricingEngine.calculateCostCents(span.usage.promptTokens ?? 0, span.usage.completionTokens ?? 0, model)
+        }
+      }
+    }
+
+    return {
+      sessionId,
+      traceCount: traces.length,
+      promptTokens,
+      completionTokens,
+      totalCostCents,
+      totalCostDollars: totalCostCents / 100
+    }
+  }
+
+  /**
+   * Calculate time-windowed cost aggregation across all traces.
+   * Window is specified in hours (e.g., 24 for last 24 hours).
+   * Returns cost in cents (integer) and dollars (float), plus token breakdown and trace count.
+   */
+  getTimeWindowCost(windowHours: number): { windowHours: number; traceCount: number; promptTokens: number; completionTokens: number; totalCostCents: number; totalCostDollars: number } {
+    const now = new Date()
+    const cutoff = new Date(now.getTime() - windowHours * 60 * 60 * 1000)
+    const cutoffIso = cutoff.toISOString()
+
+    const traces = this.list({ startTimeGte: cutoffIso })
+    let promptTokens = 0
+    let completionTokens = 0
+    let totalCostCents = 0
+
+    for (const trace of traces) {
+      for (const span of trace.spans) {
+        if (span.usage) {
+          promptTokens += span.usage.promptTokens ?? 0
+          completionTokens += span.usage.completionTokens ?? 0
+          const model = (span.attributes?.['llm.model'] as string) ?? 'gpt-4o'
+          totalCostCents += pricingEngine.calculateCostCents(span.usage.promptTokens ?? 0, span.usage.completionTokens ?? 0, model)
+        }
+      }
+    }
+
+    return {
+      windowHours,
+      traceCount: traces.length,
+      promptTokens,
+      completionTokens,
+      totalCostCents,
+      totalCostDollars: totalCostCents / 100
+    }
   }
 }

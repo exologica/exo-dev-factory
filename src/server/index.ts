@@ -7,6 +7,7 @@ import { traceSchema } from '../domain/trace.js'
 import { z } from 'zod'
 import { TraceStore } from '../domain/store.js'
 import type { Trace } from '../domain/trace.js'
+import { pricingEngine } from '../domain/pricing.js'
 
 // Durable by default: traces survive restarts in a local SQLite file. The
 // location is deterministic and documented (README); override with
@@ -111,6 +112,36 @@ app.delete('/api/traces/:id', (c) => {
     return c.json({ error: 'trace not found' }, 404)
   }
   return c.body(null, 204)
+})
+
+// Cost aggregation endpoints
+
+const costQuerySchema = z.object({
+  // Clamp window to [1, 8760] (max 1 year in hours); invalid/missing falls back to 24.
+  window: z.coerce.number().int().positive().transform((v) => Math.min(Math.max(v, 1), 8760)).catch(24)
+})
+
+app.get('/api/traces/:id/cost', (c) => {
+  const cost = store.getTraceCost(c.req.param('id'))
+  if (!cost) {
+    return c.json({ error: 'trace not found' }, 404)
+  }
+  return c.json(cost)
+})
+
+app.get('/api/sessions/:sessionId/cost', (c) => {
+  const sessionId = c.req.param('sessionId')
+  if (!sessionId || sessionId.length > 128) {
+    return c.json({ error: 'invalid sessionId' }, 400)
+  }
+  const cost = store.getSessionCost(sessionId)
+  return c.json(cost)
+})
+
+app.get('/api/cost/summary', (c) => {
+  const query = costQuerySchema.parse(c.req.query())
+  const cost = store.getTimeWindowCost(query.window)
+  return c.json(cost)
 })
 
 app.post('/v1/proxy/chat/completions', async (c) => {
