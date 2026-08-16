@@ -5,19 +5,40 @@ import { spanDurationMs, traceDurationMs } from '../domain/trace'
 const fmtMs = (ms: number) => `${ms}ms`
 const PAGE_SIZE = 10
 
-function TraceRow({ trace, active, onSelect }: { trace: Trace; active: boolean; onSelect: () => void }) {
+function TraceRow({
+  trace,
+  active,
+  onSelect,
+  onDelete
+}: {
+  trace: Trace
+  active: boolean
+  onSelect: () => void
+  onDelete: () => void
+}) {
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={active ? 'row active' : 'row'}
-      aria-current={active ? 'true' : undefined}
-    >
-      <span className="name">{trace.name}</span>
-      <span className="meta">
-        {trace.spans.length} span{trace.spans.length === 1 ? '' : 's'} · {fmtMs(traceDurationMs(trace))}
-      </span>
-    </button>
+    <div className={active ? 'row active' : 'row'}>
+      <button
+        type="button"
+        className="row-main"
+        onClick={onSelect}
+        aria-current={active ? 'true' : undefined}
+      >
+        <span className="name">{trace.name}</span>
+        <span className="meta">
+          {trace.spans.length} span{trace.spans.length === 1 ? '' : 's'} · {fmtMs(traceDurationMs(trace))}
+        </span>
+      </button>
+      <button
+        type="button"
+        className="row-delete"
+        aria-label={`Delete ${trace.name}`}
+        title="Delete trace"
+        onClick={onDelete}
+      >
+        ✕
+      </button>
+    </div>
   )
 }
 
@@ -59,6 +80,18 @@ export default function App() {
     if (!r.ok) return
     setSelected(await (r.json() as Promise<Trace>))
   }, [])
+
+  const deleteTrace = useCallback(async (trace: Trace) => {
+    const r = await fetch(`/api/traces/${trace.id}`, { method: 'DELETE' })
+    // 204 (deleted) and 404 (already gone) both mean the trace should leave
+    // the list; any other status leaves the list untouched.
+    if (r.status !== 204 && r.status !== 404) return
+    const remaining = traces.filter((t) => t.id !== trace.id)
+    setTraces(remaining)
+    setSelected((sel) => (sel?.id === trace.id ? null : sel))
+    // Stepping back keeps the visible page populated after removing its last trace.
+    if (remaining.length === 0 && page > 0) setPage((p) => p - 1)
+  }, [page, traces])
 
   const applyStatus = (status: 'all' | 'ok' | 'error') => {
     setStatusFilter(status)
@@ -107,6 +140,7 @@ export default function App() {
               trace={t}
               active={selected?.id === t.id}
               onSelect={() => void selectTrace(t.id!)}
+              onDelete={() => void deleteTrace(t)}
             />
           ))}
           <div className="pager">
@@ -162,10 +196,13 @@ export default function App() {
         .layout { display: grid; grid-template-columns: 320px 1fr; gap: 24px; margin-top: 16px; }
         @media (max-width: 720px) { .layout { grid-template-columns: 1fr; } }
         .list h2, .detail h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #8b949e; }
-        .row { display: flex; justify-content: space-between; gap: 12px; width: 100%; text-align: left; background: #161a20; border: 1px solid #232830; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; color: inherit; font: inherit; }
+        .row { display: flex; align-items: center; gap: 6px; width: 100%; background: #161a20; border: 1px solid #232830; border-radius: 8px; padding: 6px 8px 6px 12px; margin-bottom: 8px; }
         .row.active { border-color: #4c8bf5; background: #1a2130; }
-        .row .name { font-weight: 600; }
+        .row-main { flex: 1; display: flex; justify-content: space-between; gap: 12px; min-width: 0; text-align: left; background: none; border: none; padding: 4px 0; color: inherit; font: inherit; cursor: pointer; }
+        .row-main .name { font-weight: 600; }
         .row .meta, .span .meta { color: #8b949e; white-space: nowrap; }
+        .row-delete { background: none; border: none; color: #8b949e; font: inherit; font-size: 12px; line-height: 1; cursor: pointer; padding: 4px 6px; border-radius: 4px; }
+        .row-delete:hover { color: #ffb4b4; background: #3d1d1d; }
         .spans { list-style: none; padding: 0; margin: 0; }
         .span { display: flex; justify-content: space-between; gap: 12px; background: #161a20; border: 1px solid #232830; border-left: 3px solid #2f9e44; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px; }
         .span.error { border-left-color: #e03131; }
