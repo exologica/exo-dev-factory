@@ -713,6 +713,169 @@ describe('Anthropic chat completions proxy', () => {
   })
 })
 
+describe('Google Gemini generateContent proxy', () => {
+  const mockGeminiResponse = {
+    candidates: [
+      {
+        content: {
+          parts: [{ text: 'Hello!' }],
+          role: 'model'
+        },
+        finishReason: 'STOP',
+        index: 0
+      }
+    ],
+    usageMetadata: {
+      promptTokenCount: 15,
+      candidatesTokenCount: 10,
+      totalTokenCount: 25
+    },
+    modelVersion: 'gemini-1.5-pro'
+  }
+
+  const mockErrorResponse = {
+    error: { message: 'API key not valid', code: 400, status: 'INVALID_ARGUMENT' }
+  }
+
+  const GEMINI_URL_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
+  const originalFetch = global.fetch
+
+  function makeGeminiProxyRequest(body: unknown, apiKey = 'test-key') {
+    return fetch(`${baseUrl}/v1/proxy/gemini/generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify(body)
+    })
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${GEMINI_URL_BASE}/`)) {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockGeminiResponse) }),
+          json: () => Promise.resolve(mockGeminiResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns 401 when x-goog-api-key header is missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/gemini/generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gemini-1.5-pro', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] })
+    })
+    expect(res.status).toBe(401)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing or invalid x-goog-api-key header')
+  })
+
+  it('accepts Authorization header as fallback for x-goog-api-key', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/gemini/generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gemini-1.5-pro', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] })
+    })
+    expect(res.status).toBe(200)
+  })
+
+  it('returns 400 for invalid JSON body', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/gemini/generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': 'test-key' },
+      body: '{not json'
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid JSON body')
+  })
+
+  it('forwards request to Gemini and returns response with trace on success', async () => {
+    const res = await makeGeminiProxyRequest({ model: 'gemini-1.5-pro', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockGeminiResponse)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gemini-1.5-pro')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('google')
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(15)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(10)
+    expect(typeof proxyTrace?.spans[0]?.usage?.totalCost).toBe('number')
+
+    // Security: API key must not be in trace
+    expect(proxyTrace?.spans[0]?.attributes?.['x-goog-api-key']).toBeUndefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['authorization']).toBeUndefined()
+  })
+
+  it('creates error trace when upstream fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${GEMINI_URL_BASE}/`)) {
+        return {
+          ok: false,
+          status: 400,
+          clone: () => ({ json: () => Promise.resolve(mockErrorResponse) }),
+          json: () => Promise.resolve(mockErrorResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeGeminiProxyRequest({ model: 'gemini-1.5-pro', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] })
+    expect(res.status).toBe(400)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('google')
+    expect(errorTrace?.spans[0]?.attributes?.['http.status']).toBe(400)
+  })
+
+  it('creates error trace when network request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${GEMINI_URL_BASE}/`)) {
+        throw new Error('ENOTFOUND')
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeGeminiProxyRequest({ model: 'gemini-1.5-pro', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] })
+    expect(res.status).toBe(502)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
+  })
+
+  it('uses default model when not specified', async () => {
+    const res = await makeGeminiProxyRequest({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] })
+    expect(res.status).toBe(200)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gemini-1.5-pro')
+  })
+})
+
 describe('cost aggregation API', () => {
   function seedTraceWithUsage(
     name: string,
