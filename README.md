@@ -46,6 +46,26 @@ Traces persist across server restarts in the SQLite database file (default
 `data/traces.db`, gitignored). The store initializes its schema idempotently
 and uses strictly parameterized queries for all reads and writes.
 
+## API
+
+`POST /api/traces` ingests a trace (validated against the trace schema) and
+returns `201` with the created trace id.
+
+`GET /api/traces` returns traces newest-first and accepts optional query
+parameters:
+
+| Param | Default | Description |
+|---|---|---|
+| `limit` | `100` | Maximum number of traces to return, capped at `100` |
+| `offset` | `0` | Number of traces to skip (for paging) |
+| `status` | (all) | Filter to `ok` or `error` traces only |
+
+Invalid or missing parameters degrade safely to these defaults. A trace's
+status is derived from its spans: `error` when any span failed, otherwise
+`ok`.
+
+`GET /api/traces/:id` returns a single trace, or `404` when unknown.
+
 ## Security
 
 Report vulnerabilities privately via

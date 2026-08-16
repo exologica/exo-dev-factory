@@ -128,3 +128,79 @@ describe('trace API over real HTTP', () => {
     restarted.close()
   })
 })
+
+describe('trace API list pagination and filtering', () => {
+  function seedTrace(startTime: string, name: string, spanStatus: 'ok' | 'error' = 'ok') {
+    return fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        startTime,
+        endTime: new Date(Date.parse(startTime) + 1000).toISOString(),
+        spans: [
+          {
+            id: `span-${name}`,
+            name: 'parse',
+            startTime,
+            endTime: new Date(Date.parse(startTime) + 500).toISOString(),
+            status: spanStatus
+          }
+        ]
+      })
+    })
+  }
+
+  it('paginates GET /api/traces with limit and offset', async () => {
+    for (let i = 0; i < 15; i += 1) {
+      await seedTrace(`2026-08-16T12:${String(i).padStart(2, '0')}:00.000Z`, `page-${i}`)
+    }
+
+    const page1 = (await (await fetch(`${baseUrl}/api/traces?limit=10`)).json()) as {
+      id: string
+      name: string
+    }[]
+    expect(page1).toHaveLength(10)
+    expect(page1[0]?.name).toBe('page-14')
+
+    // The suite shares one DB file, so other tests may have seeded traces too.
+    // Expected remainder is the true total minus the first page.
+    const all = (await (await fetch(`${baseUrl}/api/traces`)).json()) as { id: string; name: string }[]
+    const page2 = (await (
+      await fetch(`${baseUrl}/api/traces?limit=10&offset=10`)
+    ).json()) as { id: string; name: string }[]
+    expect(page2).toHaveLength(all.length - 10)
+    const page1Ids = new Set(page1.map((t) => t.id))
+    expect(page2.every((t) => !page1Ids.has(t.id))).toBe(true)
+  })
+
+  it('filters GET /api/traces by derived status', async () => {
+    await seedTrace('2026-08-16T13:00:00.000Z', 'ok-filtered')
+    await seedTrace('2026-08-16T13:01:00.000Z', 'err-a', 'error')
+    await seedTrace('2026-08-16T13:02:00.000Z', 'err-b', 'error')
+
+    const res = await fetch(`${baseUrl}/api/traces?status=error`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { name: string }[]
+    expect(body).toHaveLength(2)
+    expect(body.map((t) => t.name).sort()).toEqual(['err-a', 'err-b'])
+  })
+
+  it('clamps the limit to the documented maximum', async () => {
+    for (let i = 0; i < 120; i += 1) {
+      await seedTrace(`2026-08-16T14:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`, `bulk-${i}`)
+    }
+
+    const res = await fetch(`${baseUrl}/api/traces?limit=9999`)
+    const body = (await res.json()) as unknown[]
+    expect(body).toHaveLength(100)
+  })
+
+  it('degrades invalid pagination parameters to documented defaults', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?limit=abc&offset=-3&status=bogus`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as unknown[]
+    expect(Array.isArray(body)).toBe(true)
+    expect(body.length).toBeLessThanOrEqual(100)
+  })
+})
