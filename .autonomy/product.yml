@@ -1,0 +1,24 @@
+schema: autonomy.openai/v1
+product:
+  name: exo-dev-factory
+  type: app
+repository:
+  owner: exologica
+  name: exo-dev-factory
+  defaultBranch: main
+  mergeStrategy: merge
+runtime:
+  node: ">=22"
+  packageManager: pnpm
+commands:
+  install: pnpm install --frozen-lockfile
+  build: pnpm build
+  typecheck: pnpm typecheck
+  unit: pnpm unit
+  integration: pnpm integration
+  smoke: pnpm smoke
+limits:
+  tickMinutes: 90
+  commitsMin: 1
+  commitsMax: 3
+  loopMinutes: 30

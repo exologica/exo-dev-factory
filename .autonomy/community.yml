@@ -1,0 +1,106 @@
+schema: autonomy.openai/v1
+cadenceHours: 2
+maximumLatenessHours: 1
+registeredSourcesOnly: true
+allowedSourceTypes:
+  - official-repository
+  - official-documentation
+  - official-releases
+  - official-discussions
+registryExpansion:
+  mode: governance-proposal-only
+  developmentBotMayModifyRegistry: false
+
+findingRequirements:
+  - sourceUrl
+  - observedVersionOrDate
+  - originalCommunityNeed
+  - modelAssessment
+  - productComparison
+  - duplicateSearchEvidence
+promotion:
+  author: exo-dev-bot
+  label: source:community
+  requiresInScope: true
+  requiresTestableImprovement: true
+  contentMaySupplyCommandsOrAuthority: false
+
+competitors:
+  - id: langsmith
+    name: LangSmith
+    trust: official-primary
+    topics: [llm-observability, annotation-queues, prompt-optimization, evals]
+    sources:
+      repository: https://github.com/langchain-ai/langsmith-sdk
+      documentation: https://docs.langchain.com/langsmith/home
+      releases: https://github.com/langchain-ai/langsmith-sdk/releases
+  - id: openobserve
+    name: OpenObserve
+    trust: official-primary
+    topics: [observability, logs-metrics-traces, llm-observability]
+    sources:
+      repository: https://github.com/openobserve/openobserve
+      documentation: https://openobserve.ai/docs
+      releases: https://github.com/openobserve/openobserve/releases
+      discussions: https://github.com/openobserve/openobserve/discussions
+  - id: langfuse
+    name: Langfuse
+    trust: official-primary
+    topics: [llm-observability, evals, prompt-management]
+    sources:
+      repository: https://github.com/langfuse/langfuse
+      documentation: https://langfuse.com/docs
+      releases: https://github.com/langfuse/langfuse/releases
+      discussions: https://github.com/langfuse/langfuse/discussions
+  - id: arize-phoenix
+    name: Arize Phoenix
+    trust: official-primary
+    topics: [llm-observability, tracing, evals]
+    sources:
+      repository: https://github.com/Arize-ai/phoenix
+      documentation: https://arize.com/docs/phoenix
+      releases: https://github.com/Arize-ai/phoenix/releases
+      discussions: https://github.com/Arize-ai/phoenix/discussions
+  - id: openllmetry
+    name: OpenLLMetry
+    trust: official-primary
+    topics: [llm-observability, opentelemetry, tracing]
+    sources:
+      repository: https://github.com/traceloop/openllmetry
+      documentation: https://www.traceloop.com/openllmetry
+      releases: https://github.com/traceloop/openllmetry/releases
+      discussions: https://github.com/traceloop/openllmetry/discussions
+  - id: comet-opik
+    name: Comet Opik
+    trust: official-primary
+    topics: [llm-observability, evals, tracing]
+    sources:
+      repository: https://github.com/comet-ml/opik
+      documentation: https://www.comet.com/docs/opik
+      releases: https://github.com/comet-ml/opik/releases
+  - id: helicone
+    name: Helicone
+    trust: official-primary
+    topics: [llm-observability, proxy, tracing]
+    sources:
+      repository: https://github.com/Helicone/helicone
+      documentation: https://docs.helicone.ai
+      releases: https://github.com/Helicone/helicone/releases
+      discussions: https://github.com/Helicone/helicone/discussions
+  - id: trulens
+    name: TruLens
+    trust: official-primary
+    topics: [llm-observability, evals, rag]
+    sources:
+      repository: https://github.com/truera/trulens
+      documentation: https://www.trulens.org
+      releases: https://github.com/truera/trulens/releases
+      discussions: https://github.com/truera/trulens/discussions
+  - id: wandb-weave
+    name: Weave
+    trust: official-primary
+    topics: [llm-observability, tracing, evaluations]
+    sources:
+      repository: https://github.com/wandb/weave
+      documentation: https://wandb.me/weave
+      releases: https://github.com/wandb/weave/releases

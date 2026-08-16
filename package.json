@@ -1,0 +1,41 @@
+{
+  "name": "exo-dev-factory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LLM trace observability seed app (governed by exo-dev-factory autonomy contract)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.server.json && tsc --noEmit -p tsconfig.client.json && tsc --noEmit -p tsconfig.tests.json",
+    "unit": "vitest run tests/unit",
+    "integration": "vitest run tests/integration",
+    "smoke": "node scripts/smoke.mjs",
+    "start": "node dist/server/server/index.js",
+    "dev": "tsx watch src/server/index.ts",
+    "dev:client": "vite"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.16.0",
+    "hono": "^4.9.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
