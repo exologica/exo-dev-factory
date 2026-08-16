@@ -1,12 +1,21 @@
 import { z } from 'zod'
 
+export const usageSchema = z
+  .object({
+    promptTokens: z.number().int().nonnegative().max(10_000_000),
+    completionTokens: z.number().int().nonnegative().max(10_000_000),
+    totalCost: z.number().nonnegative().optional()
+  })
+  .optional()
+
 export const spanSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   startTime: z.string().datetime({ offset: true }),
   endTime: z.string().datetime({ offset: true }),
   status: z.enum(['ok', 'error']),
-  attributes: z.record(z.string(), z.unknown()).optional()
+  attributes: z.record(z.string(), z.unknown()).optional(),
+  usage: usageSchema
 })
 
 export const traceSchema = z
