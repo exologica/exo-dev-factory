@@ -590,7 +590,6 @@ export default function App() {
         setTraces(res.data)
         setTotal(res.pagination.total)
         setTotalPages(res.pagination.totalPages)
-        setFilters((f) => ({ ...f, page: res.pagination.page }))
       })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'failed to load traces'))
       .finally(() => setLoading(false))
