@@ -16,6 +16,26 @@ const validTrace = {
   ]
 }
 
+const validTraceWithUsage = {
+  name: 'chat-completion',
+  startTime: '2026-08-15T10:00:00.000Z',
+  endTime: '2026-08-15T10:00:05.000Z',
+  spans: [
+    {
+      id: 'span-1',
+      name: 'llm-call',
+      startTime: '2026-08-15T10:00:00.000Z',
+      endTime: '2026-08-15T10:00:04.000Z',
+      status: 'ok',
+      usage: {
+        promptTokens: 100,
+        completionTokens: 50,
+        totalCost: 0.0015
+      }
+    }
+  ]
+}
+
 describe('traceSchema', () => {
   it('accepts a valid trace', () => {
     const result = traceSchema.safeParse(validTrace)
@@ -54,5 +74,109 @@ describe('traceSchema', () => {
   it('rejects non-ISO timestamps', () => {
     const result = traceSchema.safeParse({ ...validTrace, startTime: 'not-a-date' })
     expect(result.success).toBe(false)
+  })
+
+  describe('usage validation', () => {
+    it('accepts a trace with valid usage object', () => {
+      const result = traceSchema.safeParse(validTraceWithUsage)
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.spans[0]?.usage).toEqual({
+          promptTokens: 100,
+          completionTokens: 50,
+          totalCost: 0.0015
+        })
+      }
+    })
+
+    it('accepts a trace with usage object without totalCost', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{
+          ...validTraceWithUsage.spans[0]!,
+          usage: { promptTokens: 100, completionTokens: 50 }
+        }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.spans[0]?.usage).toEqual({
+          promptTokens: 100,
+          completionTokens: 50,
+          totalCost: undefined
+        })
+      }
+    })
+
+    it('accepts a trace with span missing usage (backward compatible)', () => {
+      const result = traceSchema.safeParse(validTrace)
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.spans[0]?.usage).toBeUndefined()
+      }
+    })
+
+    it('rejects negative promptTokens', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: -1, completionTokens: 50 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects negative completionTokens', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: 100, completionTokens: -1 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects negative totalCost', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: 100, completionTokens: 50, totalCost: -0.01 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects non-integer promptTokens', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: 100.5, completionTokens: 50 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects non-integer completionTokens', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: 100, completionTokens: 50.5 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects promptTokens exceeding max bound', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: 10_000_001, completionTokens: 50 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects completionTokens exceeding max bound', () => {
+      const trace = {
+        ...validTraceWithUsage,
+        spans: [{ ...validTraceWithUsage.spans[0]!, usage: { promptTokens: 100, completionTokens: 10_000_001 } }]
+      }
+      const result = traceSchema.safeParse(trace)
+      expect(result.success).toBe(false)
+    })
   })
 })

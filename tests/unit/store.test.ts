@@ -6,7 +6,7 @@ import { TraceStore } from '../../src/domain/store.js'
 import type { Trace } from '../../src/domain/trace.js'
 import Database from 'better-sqlite3'
 
-function makeTrace(startTime: string, name = 'trace', spanStatus: 'ok' | 'error' = 'ok'): Trace {
+function makeTrace(startTime: string, name = 'trace', spanStatus: 'ok' | 'error' = 'ok', usage?: { promptTokens: number; completionTokens: number; totalCost?: number }): Trace {
   return {
     name,
     startTime,
@@ -17,7 +17,8 @@ function makeTrace(startTime: string, name = 'trace', spanStatus: 'ok' | 'error'
         name: 'llm-call',
         startTime,
         endTime: new Date(Date.parse(startTime) + 500).toISOString(),
-        status: spanStatus
+        status: spanStatus,
+        usage
       }
     ]
   }
@@ -246,5 +247,106 @@ describe('TraceStore (SQLite file-backed)', () => {
     expect(store.list({ status: 'error' }).map((t) => t.id)).toEqual(['legacy-err'])
     expect(store.list({ status: 'ok' })).toEqual([])
     store.close()
+  })
+
+  describe('usage field persistence', () => {
+    it('persists and hydrates usage fields in spans', () => {
+      const store = new TraceStore({ dbPath })
+      const traceWithUsage = makeTrace('2026-08-15T10:00:00.000Z', 'usage-trace', 'ok', {
+        promptTokens: 150,
+        completionTokens: 75,
+        totalCost: 0.00225
+      })
+      const id = store.add(traceWithUsage)
+      store.close()
+
+      const reopened = new TraceStore({ dbPath })
+      const retrieved = reopened.get(id)
+      expect(retrieved).toBeDefined()
+      expect(retrieved?.spans[0]?.usage).toEqual({
+        promptTokens: 150,
+        completionTokens: 75,
+        totalCost: 0.00225
+      })
+      reopened.close()
+    })
+
+    it('persists and hydrates usage fields without totalCost', () => {
+      const store = new TraceStore({ dbPath })
+      const traceWithUsage = makeTrace('2026-08-15T10:00:00.000Z', 'usage-trace-no-cost', 'ok', {
+        promptTokens: 150,
+        completionTokens: 75
+      })
+      const id = store.add(traceWithUsage)
+      store.close()
+
+      const reopened = new TraceStore({ dbPath })
+      const retrieved = reopened.get(id)
+      expect(retrieved).toBeDefined()
+      expect(retrieved?.spans[0]?.usage).toEqual({
+        promptTokens: 150,
+        completionTokens: 75,
+        totalCost: undefined
+      })
+      reopened.close()
+    })
+
+    it('persists traces without usage fields (backward compatible)', () => {
+      const store = new TraceStore({ dbPath })
+      const traceWithoutUsage = makeTrace('2026-08-15T10:00:00.000Z', 'no-usage-trace', 'ok')
+      const id = store.add(traceWithoutUsage)
+      store.close()
+
+      const reopened = new TraceStore({ dbPath })
+      const retrieved = reopened.get(id)
+      expect(retrieved).toBeDefined()
+      expect(retrieved?.spans[0]?.usage).toBeUndefined()
+      reopened.close()
+    })
+
+    it('round-trips usage fields through list()', () => {
+      const store = new TraceStore({ dbPath })
+      const traceWithUsage = makeTrace('2026-08-15T10:00:00.000Z', 'list-usage-trace', 'ok', {
+        promptTokens: 200,
+        completionTokens: 100,
+        totalCost: 0.003
+      })
+      store.add(traceWithUsage)
+      store.close()
+
+      const reopened = new TraceStore({ dbPath })
+      const listed = reopened.list()
+      const found = listed.find((t) => t.name === 'list-usage-trace')
+      expect(found).toBeDefined()
+      expect(found?.spans[0]?.usage).toEqual({
+        promptTokens: 200,
+        completionTokens: 100,
+        totalCost: 0.003
+      })
+      reopened.close()
+    })
+
+    it('handles mixed traces with and without usage', () => {
+      const store = new TraceStore({ dbPath })
+      store.add(makeTrace('2026-08-15T10:00:00.000Z', 'no-usage', 'ok'))
+      store.add(makeTrace('2026-08-15T10:01:00.000Z', 'with-usage', 'ok', {
+        promptTokens: 100,
+        completionTokens: 50,
+        totalCost: 0.0015
+      }))
+      store.close()
+
+      const reopened = new TraceStore({ dbPath })
+      const listed = reopened.list()
+      const noUsage = listed.find((t) => t.name === 'no-usage')
+      const withUsage = listed.find((t) => t.name === 'with-usage')
+      expect(noUsage?.spans[0]?.usage).toBeUndefined()
+      expect(withUsage?.spans[0]?.usage).toEqual({
+        promptTokens: 100,
+        completionTokens: 50,
+        totalCost: 0.0015
+      })
+      reopened.close()
+    })
   })
 })
