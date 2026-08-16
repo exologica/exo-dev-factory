@@ -1,11 +1,19 @@
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
+import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { traceSchema } from '../domain/trace.js'
 import { TraceStore } from '../domain/store.js'
 
-const store = new TraceStore()
+// Durable by default: traces survive restarts in a local SQLite file. The
+// location is deterministic and documented (README); override with
+// TRACE_DB_PATH, or pass ':memory:' for a throwaway in-memory database.
+const store = new TraceStore({
+  dbPath: process.env.TRACE_DB_PATH
+    ? path.resolve(process.env.TRACE_DB_PATH)
+    : path.resolve('data', 'traces.db')
+})
 const app = new Hono()
 
 app.post('/api/traces', async (c) => {
