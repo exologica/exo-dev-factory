@@ -90,6 +90,15 @@ async function main() {
       body: '{oops'
     })
     check('POST invalid JSON returns 400', badJson.status === 400, `got ${badJson.status}`)
+
+    const del = await fetch(`${baseUrl}/api/traces/${created.id}`, { method: 'DELETE' })
+    check('DELETE /api/traces/:id returns 204', del.status === 204, `got ${del.status}`)
+
+    const delAgain = await fetch(`${baseUrl}/api/traces/${created.id}`, { method: 'DELETE' })
+    check('DELETE unknown trace returns 404', delAgain.status === 404, `got ${delAgain.status}`)
+
+    const afterDelete = await fetch(`${baseUrl}/api/traces/${created.id}`)
+    check('GET deleted trace returns 404', afterDelete.status === 404, `got ${afterDelete.status}`)
   } finally {
     child.kill('SIGTERM')
     await delay(50)

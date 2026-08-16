@@ -204,3 +204,56 @@ describe('trace API list pagination and filtering', () => {
     expect(body.length).toBeLessThanOrEqual(100)
   })
 })
+
+describe('trace API deletion', () => {
+  async function seedTrace(name: string) {
+    const res = await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        startTime: '2026-08-16T15:00:00.000Z',
+        endTime: '2026-08-16T15:00:01.000Z',
+        spans: [
+          {
+            id: `span-${name}`,
+            name: 'parse',
+            startTime: '2026-08-16T15:00:00.000Z',
+            endTime: '2026-08-16T15:00:00.500Z',
+            status: 'ok'
+          }
+        ]
+      })
+    })
+    return ((await res.json()) as { id: string }).id
+  }
+
+  it('deletes an existing trace and removes it from list and get', async () => {
+    const id = await seedTrace('doomed')
+
+    const del = await fetch(`${baseUrl}/api/traces/${id}`, { method: 'DELETE' })
+    expect(del.status).toBe(204)
+
+    const list = (await (await fetch(`${baseUrl}/api/traces`)).json()) as { id: string }[]
+    expect(list.some((t) => t.id === id)).toBe(false)
+
+    const byId = await fetch(`${baseUrl}/api/traces/${id}`)
+    expect(byId.status).toBe(404)
+  })
+
+  it('returns 404 when deleting an unknown trace id', async () => {
+    const res = await fetch(`${baseUrl}/api/traces/no-such-id`, { method: 'DELETE' })
+    expect(res.status).toBe(404)
+  })
+
+  it('leaves other traces intact when deleting one', async () => {
+    const keeper = await seedTrace('keeper')
+    const doomed = await seedTrace('doomed-2')
+
+    const del = await fetch(`${baseUrl}/api/traces/${doomed}`, { method: 'DELETE' })
+    expect(del.status).toBe(204)
+
+    const byId = await fetch(`${baseUrl}/api/traces/${keeper}`)
+    expect(byId.status).toBe(200)
+  })
+})
