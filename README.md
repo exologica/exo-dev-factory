@@ -56,13 +56,34 @@ parameters:
 
 | Param | Default | Description |
 |---|---|---|
-| `limit` | `100` | Maximum number of traces to return, capped at `100` |
-| `offset` | `0` | Number of traces to skip (for paging) |
+| `page` | `1` | Page number (1-based) for pagination |
+| `limit` | `20` | Maximum number of traces per page, capped at `100` |
+| `offset` | (computed from page) | Legacy offset-based pagination (number of traces to skip) |
 | `status` | (all) | Filter to `ok` or `error` traces only |
+| `sessionId` | (all) | Filter traces by sessionId |
+| `userId` | (all) | Filter traces by userId |
+| `serviceName` | (all) | Filter traces by service name (trace name) |
+| `operationName` | (all) | Filter traces by operation name (first span name) |
+| `startTimeGte` | (all) | Filter traces with startTime >= this value (ISO 8601) |
+| `startTimeLte` | (all) | Filter traces with startTime <= this value (ISO 8601) |
+| `sort` | `startTime:desc` | Sort field and direction: `startTime:asc\|desc`, `durationMs:asc\|desc`, `name:asc\|desc` |
 
 Invalid or missing parameters degrade safely to these defaults. A trace's
 status is derived from its spans: `error` when any span failed, otherwise
 `ok`.
+
+Response format:
+```json
+{
+  "data": [/* Trace[] */],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "total": 100,
+    "totalPages": 5
+  }
+}
+```
 
 `GET /api/traces/:id` returns a single trace, or `404` when unknown.
 
