@@ -4,6 +4,7 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { traceSchema } from '../domain/trace.js'
+import { z } from 'zod'
 import { TraceStore } from '../domain/store.js'
 
 // Durable by default: traces survive restarts in a local SQLite file. The
@@ -29,7 +30,18 @@ app.post('/api/traces', async (c) => {
   return c.json({ id }, 201)
 })
 
-app.get('/api/traces', (c) => c.json(store.list()))
+const MAX_TRACE_LIST_LIMIT = 100
+
+// Query params degrade safely to documented defaults: a missing, non-numeric,
+// out-of-range, or unknown status value falls back instead of erroring, and
+// the limit is hard-capped so responses stay bounded.
+const listQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(MAX_TRACE_LIST_LIMIT).catch(MAX_TRACE_LIST_LIMIT),
+  offset: z.coerce.number().int().nonnegative().catch(0),
+  status: z.enum(['ok', 'error']).optional().catch(undefined)
+})
+
+app.get('/api/traces', (c) => c.json(store.list(listQuerySchema.parse(c.req.query()))))
 
 app.get('/api/traces/:id', (c) => {
   const trace = store.get(c.req.param('id'))

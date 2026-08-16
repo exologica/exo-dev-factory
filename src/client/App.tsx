@@ -3,6 +3,7 @@ import type { Span, Trace } from '../domain/trace'
 import { spanDurationMs, traceDurationMs } from '../domain/trace'
 
 const fmtMs = (ms: number) => `${ms}ms`
+const PAGE_SIZE = 10
 
 function TraceRow({ trace, active, onSelect }: { trace: Trace; active: boolean; onSelect: () => void }) {
   return (
@@ -36,9 +37,14 @@ export default function App() {
   const [selected, setSelected] = useState<Trace | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [page, setPage] = useState(0)
+  const [statusFilter, setStatusFilter] = useState<'all' | 'ok' | 'error'>('all')
 
   useEffect(() => {
-    fetch('/api/traces')
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE) })
+    if (statusFilter !== 'all') params.set('status', statusFilter)
+    setLoading(true)
+    fetch(`/api/traces?${params}`)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         return r.json() as Promise<Trace[]>
@@ -46,13 +52,21 @@ export default function App() {
       .then(setTraces)
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'failed to load traces'))
       .finally(() => setLoading(false))
-  }, [])
+  }, [page, statusFilter])
 
   const selectTrace = useCallback(async (id: string) => {
     const r = await fetch(`/api/traces/${id}`)
     if (!r.ok) return
     setSelected(await (r.json() as Promise<Trace>))
   }, [])
+
+  const applyStatus = (status: 'all' | 'ok' | 'error') => {
+    setStatusFilter(status)
+    setPage(0)
+  }
+
+  const hasNext = traces.length === PAGE_SIZE
+  const hasPrev = page > 0
 
   return (
     <main>
@@ -66,8 +80,27 @@ export default function App() {
       <section className="layout">
         <aside className="list">
           <h2>Traces</h2>
+          <div className="filters" role="group" aria-label="Filter traces">
+            {(['all', 'ok', 'error'] as const).map((s) => (
+              <button
+                key={s}
+                type="button"
+                className={statusFilter === s ? 'filter active' : 'filter'}
+                aria-pressed={statusFilter === s}
+                onClick={() => applyStatus(s)}
+              >
+                {s === 'all' ? 'All' : s === 'ok' ? 'OK' : 'Errors'}
+              </button>
+            ))}
+          </div>
           {loading && <p className="muted">Loading…</p>}
-          {!loading && traces.length === 0 && <p className="muted">No traces yet. POST one to /api/traces.</p>}
+          {!loading && traces.length === 0 && (
+            <p className="muted">
+              {statusFilter === 'all'
+                ? 'No traces yet. POST one to /api/traces.'
+                : 'No traces match this filter.'}
+            </p>
+          )}
           {traces.map((t) => (
             <TraceRow
               key={t.id}
@@ -76,6 +109,25 @@ export default function App() {
               onSelect={() => void selectTrace(t.id!)}
             />
           ))}
+          <div className="pager">
+            <button
+              type="button"
+              className="page"
+              disabled={!hasPrev}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              ← Prev
+            </button>
+            <span className="muted">Page {page + 1}</span>
+            <button
+              type="button"
+              className="page"
+              disabled={!hasNext}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              Next →
+            </button>
+          </div>
         </aside>
 
         <section className="detail">
@@ -117,6 +169,12 @@ export default function App() {
         .spans { list-style: none; padding: 0; margin: 0; }
         .span { display: flex; justify-content: space-between; gap: 12px; background: #161a20; border: 1px solid #232830; border-left: 3px solid #2f9e44; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px; }
         .span.error { border-left-color: #e03131; }
+        .filters { display: flex; gap: 6px; margin-bottom: 10px; }
+        .filter { background: #161a20; border: 1px solid #232830; color: #8b949e; border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+        .filter.active { border-color: #4c8bf5; color: #e6e8eb; background: #1a2130; }
+        .pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; }
+        .page { background: #161a20; border: 1px solid #232830; color: #e6e8eb; border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+        .page:disabled { opacity: .45; cursor: default; }
       `}</style>
     </main>
   )

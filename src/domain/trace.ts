@@ -25,6 +25,13 @@ export const traceSchema = z
 export type Span = z.infer<typeof spanSchema>
 export type Trace = z.infer<typeof traceSchema>
 
+export type TraceStatus = 'ok' | 'error'
+
+/** A trace is 'error' when any of its spans failed; otherwise 'ok'. */
+export function traceStatus(trace: Trace): TraceStatus {
+  return trace.spans.some((s) => s.status === 'error') ? 'error' : 'ok'
+}
+
 export function spanDurationMs(span: Span): number {
   return Date.parse(span.endTime) - Date.parse(span.startTime)
 }
