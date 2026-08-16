@@ -15,6 +15,105 @@ const fmtMs = (ms: number) => `${ms}ms`
 const PAGE_SIZES = [10, 20, 50, 100] as const
 const DEFAULT_PAGE_SIZE = 10
 const DEBOUNCE_MS = 300
+const URL_SYNC_DEBOUNCE_MS = 300
+
+const URL_PARAM_KEYS = {
+  serviceName: 'serviceName',
+  operationName: 'operationName',
+  status: 'status',
+  startTimeGte: 'startTimeGte',
+  startTimeLte: 'startTimeLte',
+  page: 'page',
+  limit: 'limit',
+  sort: 'sort',
+  sortDir: 'sortDir'
+} as const
+
+function filtersToSearchParams(filters: FilterState): URLSearchParams {
+  const params = new URLSearchParams()
+  if (filters.serviceName !== '') params.set(URL_PARAM_KEYS.serviceName, filters.serviceName)
+  if (filters.operationName !== '') params.set(URL_PARAM_KEYS.operationName, filters.operationName)
+  if (filters.status !== 'all') params.set(URL_PARAM_KEYS.status, filters.status)
+  if (filters.startTimeGte !== '') params.set(URL_PARAM_KEYS.startTimeGte, filters.startTimeGte)
+  if (filters.startTimeLte !== '') params.set(URL_PARAM_KEYS.startTimeLte, filters.startTimeLte)
+  if (filters.page !== 1) params.set(URL_PARAM_KEYS.page, String(filters.page))
+  if (filters.pageSize !== DEFAULT_PAGE_SIZE) params.set(URL_PARAM_KEYS.limit, String(filters.pageSize))
+  if (filters.sort !== 'startTime') params.set(URL_PARAM_KEYS.sort, filters.sort)
+  if (filters.sortDir !== 'desc') params.set(URL_PARAM_KEYS.sortDir, filters.sortDir)
+  return params
+}
+
+function searchParamsToFilters(searchParams: URLSearchParams): Partial<FilterState> {
+  const patch: Partial<FilterState> = {}
+  
+  const serviceName = searchParams.get(URL_PARAM_KEYS.serviceName)
+  if (serviceName !== null) patch.serviceName = serviceName
+  
+  const operationName = searchParams.get(URL_PARAM_KEYS.operationName)
+  if (operationName !== null) patch.operationName = operationName
+  
+  const status = searchParams.get(URL_PARAM_KEYS.status)
+  if (status === 'ok' || status === 'error') patch.status = status
+  
+  const startTimeGte = searchParams.get(URL_PARAM_KEYS.startTimeGte)
+  if (startTimeGte !== null && startTimeGte !== '') {
+    const parsed = Date.parse(startTimeGte)
+    if (!Number.isNaN(parsed)) patch.startTimeGte = startTimeGte
+  }
+  
+  const startTimeLte = searchParams.get(URL_PARAM_KEYS.startTimeLte)
+  if (startTimeLte !== null && startTimeLte !== '') {
+    const parsed = Date.parse(startTimeLte)
+    if (!Number.isNaN(parsed)) patch.startTimeLte = startTimeLte
+  }
+  
+  const page = searchParams.get(URL_PARAM_KEYS.page)
+  if (page !== null) {
+    const parsed = Number(page)
+    if (Number.isInteger(parsed) && parsed >= 1) patch.page = parsed
+  }
+  
+  const limit = searchParams.get(URL_PARAM_KEYS.limit)
+  if (limit !== null) {
+    const parsed = Number(limit)
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 100) patch.pageSize = parsed
+  }
+  
+  const sort = searchParams.get(URL_PARAM_KEYS.sort)
+  const validSortKeys = ['startTime', 'durationMs', 'name', 'operation', 'sessionId', 'status'] as const
+  if (sort !== null && validSortKeys.includes(sort as typeof validSortKeys[number])) {
+    patch.sort = sort as FilterState['sort']
+  }
+  
+  const sortDir = searchParams.get(URL_PARAM_KEYS.sortDir)
+  if (sortDir === 'asc' || sortDir === 'desc') {
+    patch.sortDir = sortDir
+  }
+  
+  return patch
+}
+
+function getInitialFiltersFromUrl(): FilterState {
+  if (typeof window === 'undefined') return initialFilters
+  try {
+    const searchParams = new URLSearchParams(window.location.search)
+    const urlPatch = searchParamsToFilters(searchParams)
+    return { ...initialFilters, ...urlPatch }
+  } catch {
+    return initialFilters
+  }
+}
+
+function syncFiltersToUrl(filters: FilterState): void {
+  if (typeof window === 'undefined') return
+  try {
+    const params = filtersToSearchParams(filters)
+    const newUrl = params.toString() ? `${window.location.pathname}?${params}` : window.location.pathname
+    window.history.replaceState(null, '', newUrl)
+  } catch {
+    // Silently ignore URL sync errors (e.g., sandboxed iframe)
+  }
+}
 
 const SORT_OPTIONS = [
   { key: 'startTime', label: 'Timestamp' },
@@ -425,13 +524,21 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [total, setTotal] = useState(0)
   const [totalPages, setTotalPages] = useState(0)
-  const [filters, setFilters] = useState<FilterState>(initialFilters)
-  const [debouncedFilters, setDebouncedFilters] = useState<FilterState>(initialFilters)
+  const [filters, setFilters] = useState<FilterState>(() => getInitialFiltersFromUrl())
+  const [debouncedFilters, setDebouncedFilters] = useState<FilterState>(() => getInitialFiltersFromUrl())
   const [serviceNames, setServiceNames] = useState<string[]>([])
   const [operationNames, setOperationNames] = useState<string[]>([])
   const [sessionNames, setSessionNames] = useState<string[]>([])
 
-  // Debounce filter changes
+  // Sync filters to URL (debounced, replaceState)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      syncFiltersToUrl(filters)
+    }, URL_SYNC_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [filters])
+
+  // Debounce filter changes for API requests
   useEffect(() => {
     const timer = setTimeout(() => {
       setDebouncedFilters(filters)
@@ -453,7 +560,6 @@ export default function App() {
     setSessionNames(Array.from(sessions).sort())
   }, [traces])
 
-  // Fetch traces with debounced filters
   // Fetch traces with debounced filters
   useEffect(() => {
     const params = new URLSearchParams({
@@ -530,12 +636,14 @@ export default function App() {
   }, [])
 
   const clearFilters = useCallback(() => {
-    setFilters({
+    const cleared = {
       ...initialFilters,
       sort: filters.sort,
       sortDir: filters.sortDir,
       pageSize: filters.pageSize
-    })
+    }
+    setFilters(cleared)
+    syncFiltersToUrl(cleared)
   }, [filters.sort, filters.sortDir, filters.pageSize])
 
   return (
