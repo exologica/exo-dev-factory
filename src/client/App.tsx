@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Span, Trace } from '../domain/trace'
-import { spanDurationMs, traceDurationMs } from '../domain/trace'
+import {
+  spanDurationMs,
+  traceDurationMs,
+  traceTotalPromptTokens,
+  traceTotalCompletionTokens,
+  traceTotalCost,
+  traceHasUsage,
+  spanHasUsage
+} from '../domain/trace'
 
 const fmtMs = (ms: number) => `${ms}ms`
 const PAGE_SIZE = 10
@@ -16,6 +24,11 @@ function TraceRow({
   onSelect: () => void
   onDelete: () => void
 }) {
+  const hasUsage = traceHasUsage(trace)
+  const totalPrompt = traceTotalPromptTokens(trace)
+  const totalCompletion = traceTotalCompletionTokens(trace)
+  const totalCost = traceTotalCost(trace)
+
   return (
     <div className={active ? 'row active' : 'row'}>
       <button
@@ -27,6 +40,13 @@ function TraceRow({
         <span className="name">{trace.name}</span>
         <span className="meta">
           {trace.spans.length} span{trace.spans.length === 1 ? '' : 's'} · {fmtMs(traceDurationMs(trace))}
+          {hasUsage && (
+            <>
+              {' · '}
+              <span className="usage">{totalPrompt + totalCompletion} tokens</span>
+              {totalCost > 0 && <span className="cost">${totalCost.toFixed(4)}</span>}
+            </>
+          )}
         </span>
       </button>
       <button
@@ -43,11 +63,24 @@ function TraceRow({
 }
 
 function SpanRow({ span }: { span: Span }) {
+  const hasUsage = spanHasUsage(span)
+
   return (
     <li className={span.status === 'error' ? 'span error' : 'span'}>
       <span className="name">{span.name}</span>
       <span className="meta">
         {span.status} · {fmtMs(spanDurationMs(span))}
+        {hasUsage && (
+          <>
+            {' · '}
+            <span className="usage">
+              {span.usage!.promptTokens} → {span.usage!.completionTokens} tokens
+            </span>
+            {span.usage!.totalCost !== undefined && span.usage!.totalCost > 0 && (
+              <span className="cost">${span.usage!.totalCost.toFixed(4)}</span>
+            )}
+          </>
+        )}
       </span>
     </li>
   )
@@ -201,6 +234,8 @@ export default function App() {
         .row-main { flex: 1; display: flex; justify-content: space-between; gap: 12px; min-width: 0; text-align: left; background: none; border: none; padding: 4px 0; color: inherit; font: inherit; cursor: pointer; }
         .row-main .name { font-weight: 600; }
         .row .meta, .span .meta { color: #8b949e; white-space: nowrap; }
+        .usage { color: #a5d6ff; font-weight: 500; }
+        .cost { color: #ffa657; font-weight: 500; }
         .row-delete { background: none; border: none; color: #8b949e; font: inherit; font-size: 12px; line-height: 1; cursor: pointer; padding: 4px 6px; border-radius: 4px; }
         .row-delete:hover { color: #ffb4b4; background: #3d1d1d; }
         .spans { list-style: none; padding: 0; margin: 0; }

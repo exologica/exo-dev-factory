@@ -48,3 +48,23 @@ export function spanDurationMs(span: Span): number {
 export function traceDurationMs(trace: Trace): number {
   return Date.parse(trace.endTime) - Date.parse(trace.startTime)
 }
+
+export function traceTotalPromptTokens(trace: Trace): number {
+  return trace.spans.reduce((sum, s) => sum + (s.usage?.promptTokens ?? 0), 0)
+}
+
+export function traceTotalCompletionTokens(trace: Trace): number {
+  return trace.spans.reduce((sum, s) => sum + (s.usage?.completionTokens ?? 0), 0)
+}
+
+export function traceTotalCost(trace: Trace): number {
+  return trace.spans.reduce((sum, s) => sum + (s.usage?.totalCost ?? 0), 0)
+}
+
+export function traceHasUsage(trace: Trace): boolean {
+  return trace.spans.some((s) => s.usage !== undefined)
+}
+
+export function spanHasUsage(span: Span): boolean {
+  return span.usage !== undefined
+}
