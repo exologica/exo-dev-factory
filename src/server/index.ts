@@ -9,6 +9,10 @@ import { TraceStore } from '../domain/store.js'
 import type { Trace } from '../domain/trace.js'
 import { pricingEngine } from '../domain/pricing.js'
 
+// Anthropic API constants
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
+const ANTHROPIC_API_VERSION = '2023-06-01'
+
 // Durable by default: traces survive restarts in a local SQLite file. The
 // location is deterministic and documented (README); override with
 // TRACE_DB_PATH, or pass ':memory:' for a throwaway in-memory database.
@@ -230,6 +234,107 @@ app.post('/v1/proxy/chat/completions', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalCost
+        }
+      }
+    ]
+  }
+
+  store.add(trace)
+
+  return new Response(JSON.stringify(responseBody), {
+    status: response.status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  })
+})
+
+// Anthropic chat completions proxy
+app.post('/v1/proxy/anthropic/messages', async (c) => {
+  const apiKey = c.req.header('x-api-key') || c.req.header('authorization')?.replace('Bearer ', '')
+  if (!apiKey) {
+    return c.json({ error: 'missing or invalid x-api-key header' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const startTime = new Date().toISOString()
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION
+    },
+    body: JSON.stringify(body)
+  }
+
+  let response: Response
+  try {
+    response = await fetch(ANTHROPIC_URL, requestInit)
+  } catch (err) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-anthropic-messages',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': err instanceof Error ? err.message : 'unknown error',
+            'proxy.upstream': 'anthropic'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream request failed' }, 502)
+  }
+
+  const endTime = new Date().toISOString()
+  const responseBody = (await response.clone().json().catch(() => ({}))) as {
+    model?: string
+    usage?: {
+      input_tokens?: number
+      output_tokens?: number
+    }
+  }
+
+  const model = typeof responseBody.model === 'string' ? responseBody.model : 'unknown'
+  const inputTokens = typeof responseBody.usage?.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
+  const outputTokens = typeof responseBody.usage?.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
+
+  const totalCostCents = pricingEngine.calculateCostCents(inputTokens, outputTokens, model)
+  const totalCost = totalCostCents / 100
+
+  const trace: Trace = {
+    name: 'proxy-anthropic-messages',
+    startTime,
+    endTime,
+    spans: [
+      {
+        id: crypto.randomUUID(),
+        name: 'llm-call',
+        startTime,
+        endTime,
+        status: response.ok ? 'ok' : 'error',
+        attributes: {
+          'llm.model': model,
+          'proxy.upstream': 'anthropic',
+          'http.status': response.status
+        },
+        usage: {
+          promptTokens: inputTokens,
+          completionTokens: outputTokens,
           totalCost
         }
       }
