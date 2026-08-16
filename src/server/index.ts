@@ -32,19 +32,71 @@ app.post('/api/traces', async (c) => {
 })
 
 const MAX_TRACE_LIST_LIMIT = 100
+const DEFAULT_TRACE_LIST_LIMIT = 20
 
 // Query params degrade safely to documented defaults: a missing, non-numeric,
 // out-of-range, or unknown status value falls back instead of erroring, and
 // the limit is hard-capped so responses stay bounded.
 const listQuerySchema = z.object({
-  limit: z.coerce.number().int().positive().max(MAX_TRACE_LIST_LIMIT).catch(MAX_TRACE_LIST_LIMIT),
-  offset: z.coerce.number().int().nonnegative().catch(0),
+  // Page-based pagination (1-based)
+  page: z.coerce.number().int().positive().catch(1),
+  // Clamp limit to [1, MAX_TRACE_LIST_LIMIT]; invalid/missing falls back to default.
+  limit: z.coerce.number().int().positive().transform((v) => Math.min(Math.max(v, 1), MAX_TRACE_LIST_LIMIT)).catch(DEFAULT_TRACE_LIST_LIMIT),
+  // Legacy offset-based pagination (kept for backward compatibility); clamp negative to 0.
+  offset: z.coerce.number().int().transform((v) => Math.max(v, 0)).optional(),
   status: z.enum(['ok', 'error']).optional().catch(undefined),
   sessionId: z.string().max(128).optional().catch(undefined),
-  userId: z.string().max(128).optional().catch(undefined)
+  userId: z.string().max(128).optional().catch(undefined),
+  serviceName: z.string().max(256).optional().catch(undefined),
+  operationName: z.string().max(256).optional().catch(undefined),
+  startTimeGte: z.string().datetime({ offset: true }).optional().catch(undefined),
+  startTimeLte: z.string().datetime({ offset: true }).optional().catch(undefined),
+  sort: z
+    .enum([
+      'startTime:asc',
+      'startTime:desc',
+      'durationMs:asc',
+      'durationMs:desc',
+      'name:asc',
+      'name:desc'
+    ])
+    .optional()
+    .catch(undefined)
 })
 
-app.get('/api/traces', (c) => c.json(store.list(listQuerySchema.parse(c.req.query()))))
+app.get('/api/traces', (c) => {
+  const query = listQuerySchema.parse(c.req.query())
+  const page = query.page ?? 1
+  const limit = query.limit ?? DEFAULT_TRACE_LIST_LIMIT
+  const offset = query.offset ?? (page - 1) * limit
+
+  const listOptions = {
+    limit,
+    offset,
+    status: query.status,
+    sessionId: query.sessionId,
+    userId: query.userId,
+    serviceName: query.serviceName,
+    operationName: query.operationName,
+    startTimeGte: query.startTimeGte,
+    startTimeLte: query.startTimeLte,
+    sort: query.sort
+  }
+
+  const data = store.list(listOptions)
+  const total = store.count(listOptions)
+  const totalPages = Math.ceil(total / limit)
+
+  return c.json({
+    data,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages
+    }
+  })
+})
 
 app.get('/api/traces/:id', (c) => {
   const trace = store.get(c.req.param('id'))

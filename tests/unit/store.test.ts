@@ -129,6 +129,111 @@ describe('TraceStore (in-memory)', () => {
     expect(page).toHaveLength(3)
     expect(page.every((t) => t.name.startsWith('err-'))).toBe(true)
   })
+
+  it('filters by serviceName (trace name)', () => {
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'service-a'))
+    store.add(makeTrace('2026-08-15T11:00:00.000Z', 'service-b'))
+    store.add(makeTrace('2026-08-15T12:00:00.000Z', 'service-a'))
+
+    expect(store.list({ serviceName: 'service-a' }).map((t) => t.name)).toEqual(['service-a', 'service-a'])
+    expect(store.list({ serviceName: 'service-b' }).map((t) => t.name)).toEqual(['service-b'])
+  })
+
+  it('filters by operationName (first span name)', () => {
+    store.add({
+      ...makeTrace('2026-08-15T10:00:00.000Z', 'trace-1'),
+      spans: [{ id: 's1', name: 'op-a', startTime: '2026-08-15T10:00:00.000Z', endTime: '2026-08-15T10:00:00.500Z', status: 'ok' }]
+    })
+    store.add({
+      ...makeTrace('2026-08-15T11:00:00.000Z', 'trace-2'),
+      spans: [{ id: 's2', name: 'op-b', startTime: '2026-08-15T11:00:00.000Z', endTime: '2026-08-15T11:00:00.500Z', status: 'ok' }]
+    })
+    store.add({
+      ...makeTrace('2026-08-15T12:00:00.000Z', 'trace-3'),
+      spans: [{ id: 's3', name: 'op-a', startTime: '2026-08-15T12:00:00.000Z', endTime: '2026-08-15T12:00:00.500Z', status: 'ok' }]
+    })
+
+    expect(store.list({ operationName: 'op-a' }).map((t) => t.name)).toEqual(['trace-3', 'trace-1'])
+    expect(store.list({ operationName: 'op-b' }).map((t) => t.name)).toEqual(['trace-2'])
+  })
+
+  it('filters by startTime range (gte/lte)', () => {
+    store.add(makeTrace('2026-08-15T08:00:00.000Z', 'early'))
+    store.add(makeTrace('2026-08-15T12:00:00.000Z', 'mid'))
+    store.add(makeTrace('2026-08-15T16:00:00.000Z', 'late'))
+
+    expect(store.list({ startTimeGte: '2026-08-15T10:00:00.000Z' }).map((t) => t.name)).toEqual(['late', 'mid'])
+    expect(store.list({ startTimeLte: '2026-08-15T14:00:00.000Z' }).map((t) => t.name)).toEqual(['mid', 'early'])
+    expect(store.list({ startTimeGte: '2026-08-15T10:00:00.000Z', startTimeLte: '2026-08-15T14:00:00.000Z' }).map((t) => t.name)).toEqual(['mid'])
+  })
+
+  it('sorts by startTime ascending and descending', () => {
+    store.add(makeTrace('2026-08-15T08:00:00.000Z', 'early'))
+    store.add(makeTrace('2026-08-15T12:00:00.000Z', 'mid'))
+    store.add(makeTrace('2026-08-15T16:00:00.000Z', 'late'))
+
+    expect(store.list({ sort: 'startTime:asc' }).map((t) => t.name)).toEqual(['early', 'mid', 'late'])
+    expect(store.list({ sort: 'startTime:desc' }).map((t) => t.name)).toEqual(['late', 'mid', 'early'])
+  })
+
+  it('sorts by name ascending and descending', () => {
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'charlie'))
+    store.add(makeTrace('2026-08-15T11:00:00.000Z', 'alpha'))
+    store.add(makeTrace('2026-08-15T12:00:00.000Z', 'bravo'))
+
+    expect(store.list({ sort: 'name:asc' }).map((t) => t.name)).toEqual(['alpha', 'bravo', 'charlie'])
+    expect(store.list({ sort: 'name:desc' }).map((t) => t.name)).toEqual(['charlie', 'bravo', 'alpha'])
+  })
+
+  it('sorts by durationMs ascending and descending', () => {
+    store.add({
+      ...makeTrace('2026-08-15T10:00:00.000Z', 'short'),
+      spans: [{ id: 's1', name: 'x', startTime: '2026-08-15T10:00:00.000Z', endTime: '2026-08-15T10:00:00.100Z', status: 'ok' }]
+    })
+    store.add({
+      ...makeTrace('2026-08-15T11:00:00.000Z', 'long'),
+      spans: [{ id: 's2', name: 'y', startTime: '2026-08-15T11:00:00.000Z', endTime: '2026-08-15T11:00:01.000Z', status: 'ok' }]
+    })
+    store.add({
+      ...makeTrace('2026-08-15T12:00:00.000Z', 'medium'),
+      spans: [{ id: 's3', name: 'z', startTime: '2026-08-15T12:00:00.000Z', endTime: '2026-08-15T12:00:00.500Z', status: 'ok' }]
+    })
+
+    expect(store.list({ sort: 'durationMs:asc' }).map((t) => t.name)).toEqual(['short', 'medium', 'long'])
+    expect(store.list({ sort: 'durationMs:desc' }).map((t) => t.name)).toEqual(['long', 'medium', 'short'])
+  })
+
+  it('ignores invalid sort values', () => {
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'a'))
+    store.add(makeTrace('2026-08-15T11:00:00.000Z', 'b'))
+
+    expect(store.list({ sort: 'invalid' }).map((t) => t.name)).toEqual(['b', 'a'])
+    expect(store.list({ sort: 'startTime:invalid' }).map((t) => t.name)).toEqual(['b', 'a'])
+  })
+
+  it('counts traces with filters', () => {
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'service-a', 'ok'))
+    store.add(makeTrace('2026-08-15T11:00:00.000Z', 'service-b', 'error'))
+    store.add(makeTrace('2026-08-15T12:00:00.000Z', 'service-a', 'ok'))
+
+    expect(store.count({})).toBe(3)
+    expect(store.count({ serviceName: 'service-a' })).toBe(2)
+    expect(store.count({ serviceName: 'service-b' })).toBe(1)
+    expect(store.count({ status: 'error' })).toBe(1)
+    expect(store.count({ status: 'ok' })).toBe(2)
+  })
+
+  it('combines count with multiple filters', () => {
+    for (let i = 0; i < 5; i += 1) {
+      store.add(makeTrace(`2026-08-15T${String(i).padStart(2, '0')}:00:00.000Z`, `ok-${i}`, 'ok'))
+    }
+    for (let i = 0; i < 5; i += 1) {
+      store.add(makeTrace(`2026-08-15T${String(10 + i).padStart(2, '0')}:00:00.000Z`, `err-${i}`, 'error'))
+    }
+
+    expect(store.count({ status: 'error' })).toBe(5)
+    expect(store.count({ status: 'ok' })).toBe(5)
+  })
 })
 
 describe('TraceStore (SQLite file-backed)', () => {

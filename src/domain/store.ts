@@ -22,6 +22,16 @@ export interface TraceListOptions {
   sessionId?: string
   /** Only return traces with this userId. */
   userId?: string
+  /** Filter by trace name (service name). */
+  serviceName?: string
+  /** Filter by operation name (first span name). */
+  operationName?: string
+  /** Filter by startTime >= this value (ISO 8601). */
+  startTimeGte?: string
+  /** Filter by startTime <= this value (ISO 8601). */
+  startTimeLte?: string
+  /** Sort field and direction: 'startTime:asc' | 'startTime:desc' | 'durationMs:asc' | 'durationMs:desc' | 'name:asc' | 'name:desc' */
+  sort?: string
 }
 
 /**
@@ -137,10 +147,41 @@ export class TraceStore {
       where.push('userId = ?')
       params.push(options.userId)
     }
+    if (options.serviceName !== undefined) {
+      where.push('name = ?')
+      params.push(options.serviceName)
+    }
+    if (options.operationName !== undefined) {
+      where.push('EXISTS (SELECT 1 FROM json_each(data, \'$.spans\') WHERE json_extract(value, \'$.name\') = ?)')
+      params.push(options.operationName)
+    }
+    if (options.startTimeGte !== undefined) {
+      where.push('startTime >= ?')
+      params.push(options.startTimeGte)
+    }
+    if (options.startTimeLte !== undefined) {
+      where.push('startTime <= ?')
+      params.push(options.startTimeLte)
+    }
+
     const whereClause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
-    let sql = `SELECT data FROM traces${whereClause} ORDER BY startEpochMs DESC, rowid DESC`
+
+    let orderBy = 'startEpochMs DESC, rowid DESC'
+    const needsInMemorySort = options.sort === 'durationMs:asc' || options.sort === 'durationMs:desc'
+    if (options.sort !== undefined && !needsInMemorySort) {
+      const parts = options.sort.split(':')
+      const field = parts[0]
+      const direction = parts[1]
+      const validFields = ['startTime', 'name']
+      const validDirections = ['asc', 'desc']
+      if (field && direction && validFields.includes(field) && validDirections.includes(direction)) {
+        const col = field === 'startTime' ? 'startEpochMs' : field
+        orderBy = `${col} ${direction.toUpperCase()}, rowid DESC`
+      }
+    }
+
+    let sql = `SELECT data FROM traces${whereClause} ORDER BY ${orderBy}`
     if (options.limit !== undefined || options.offset !== undefined) {
-      // SQLite LIMIT -1 means "no limit", so offset-only paging stays valid.
       sql += ' LIMIT ?'
       params.push(options.limit ?? -1)
       if (options.offset !== undefined) {
@@ -149,7 +190,56 @@ export class TraceStore {
       }
     }
     const rows = this.db.prepare(sql).all(...params) as Array<{ data: string }>
-    return rows.map((row) => JSON.parse(row.data) as Trace)
+    let traces = rows.map((row) => JSON.parse(row.data) as Trace)
+
+    if (needsInMemorySort) {
+      const direction = options.sort!.split(':')[1]
+      traces.sort((a, b) => {
+        const aDur = a.spans[0] ? Date.parse(a.spans[0].endTime) - Date.parse(a.spans[0].startTime) : 0
+        const bDur = b.spans[0] ? Date.parse(b.spans[0].endTime) - Date.parse(b.spans[0].startTime) : 0
+        return direction === 'asc' ? aDur - bDur : bDur - aDur
+      })
+    }
+
+    return traces
+  }
+
+  count(options: TraceListOptions = {}): number {
+    const params: Array<string | number> = []
+    const where: string[] = []
+    if (options.status !== undefined) {
+      where.push('status = ?')
+      params.push(options.status)
+    }
+    if (options.sessionId !== undefined) {
+      where.push('sessionId = ?')
+      params.push(options.sessionId)
+    }
+    if (options.userId !== undefined) {
+      where.push('userId = ?')
+      params.push(options.userId)
+    }
+    if (options.serviceName !== undefined) {
+      where.push('name = ?')
+      params.push(options.serviceName)
+    }
+    if (options.operationName !== undefined) {
+      where.push('EXISTS (SELECT 1 FROM json_each(data, \'$.spans\') WHERE json_extract(value, \'$.name\') = ?)')
+      params.push(options.operationName)
+    }
+    if (options.startTimeGte !== undefined) {
+      where.push('startTime >= ?')
+      params.push(options.startTimeGte)
+    }
+    if (options.startTimeLte !== undefined) {
+      where.push('startTime <= ?')
+      params.push(options.startTimeLte)
+    }
+
+    const whereClause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
+    const sql = `SELECT COUNT(*) AS n FROM traces${whereClause}`
+    const row = this.db.prepare(sql).all(...params) as Array<{ n: number }>
+    return row[0]?.n ?? 0
   }
 
   get(id: string): Trace | undefined {

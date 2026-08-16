@@ -63,9 +63,10 @@ describe('trace API over real HTTP', () => {
   it('lists stored traces', async () => {
     const res = await fetch(`${baseUrl}/api/traces`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { id: string }[]
-    expect(Array.isArray(body)).toBe(true)
-    expect(body.length).toBeGreaterThan(0)
+    const body = (await res.json()) as { data: { id: string }[]; pagination: { total: number } }
+    expect(Array.isArray(body.data)).toBe(true)
+    expect(body.data.length).toBeGreaterThan(0)
+    expect(body.pagination.total).toBeGreaterThan(0)
   })
 
   it('returns a trace by id', async () => {
@@ -156,22 +157,24 @@ describe('trace API list pagination and filtering', () => {
       await seedTrace(`2026-08-16T12:${String(i).padStart(2, '0')}:00.000Z`, `page-${i}`)
     }
 
-    const page1 = (await (await fetch(`${baseUrl}/api/traces?limit=10`)).json()) as {
-      id: string
-      name: string
-    }[]
-    expect(page1).toHaveLength(10)
-    expect(page1[0]?.name).toBe('page-14')
+    const page1Res = await fetch(`${baseUrl}/api/traces?limit=10`)
+    expect(page1Res.status).toBe(200)
+    const page1Body = (await page1Res.json()) as { data: { id: string; name: string }[]; pagination: { total: number; page: number; limit: number } }
+    expect(page1Body.data).toHaveLength(10)
+    expect(page1Body.data[0]?.name).toBe('page-14')
+    expect(page1Body.pagination.page).toBe(1)
+    expect(page1Body.pagination.limit).toBe(10)
 
     // The suite shares one DB file, so other tests may have seeded traces too.
     // Expected remainder is the true total minus the first page.
-    const all = (await (await fetch(`${baseUrl}/api/traces`)).json()) as { id: string; name: string }[]
-    const page2 = (await (
-      await fetch(`${baseUrl}/api/traces?limit=10&offset=10`)
-    ).json()) as { id: string; name: string }[]
-    expect(page2).toHaveLength(all.length - 10)
-    const page1Ids = new Set(page1.map((t) => t.id))
-    expect(page2.every((t) => !page1Ids.has(t.id))).toBe(true)
+    const allRes = await fetch(`${baseUrl}/api/traces`)
+    const allBody = (await allRes.json()) as { data: { id: string; name: string }[]; pagination: { total: number } }
+    const page2Res = await fetch(`${baseUrl}/api/traces?limit=10&offset=10`)
+    expect(page2Res.status).toBe(200)
+    const page2Body = (await page2Res.json()) as { data: { id: string; name: string }[]; pagination: { total: number; page: number; limit: number } }
+    expect(page2Body.data).toHaveLength(allBody.pagination.total - 10)
+    const page1Ids = new Set(page1Body.data.map((t) => t.id))
+    expect(page2Body.data.every((t) => !page1Ids.has(t.id))).toBe(true)
   })
 
   it('filters GET /api/traces by derived status', async () => {
@@ -181,9 +184,10 @@ describe('trace API list pagination and filtering', () => {
 
     const res = await fetch(`${baseUrl}/api/traces?status=error`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { name: string }[]
-    expect(body).toHaveLength(2)
-    expect(body.map((t) => t.name).sort()).toEqual(['err-a', 'err-b'])
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(2)
+    expect(body.data.map((t) => t.name).sort()).toEqual(['err-a', 'err-b'])
+    expect(body.pagination.total).toBe(2)
   })
 
   it('clamps the limit to the documented maximum', async () => {
@@ -192,16 +196,19 @@ describe('trace API list pagination and filtering', () => {
     }
 
     const res = await fetch(`${baseUrl}/api/traces?limit=9999`)
-    const body = (await res.json()) as unknown[]
-    expect(body).toHaveLength(100)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: unknown[]; pagination: { limit: number } }
+    expect(body.data).toHaveLength(100)
+    expect(body.pagination.limit).toBe(100)
   })
 
   it('degrades invalid pagination parameters to documented defaults', async () => {
     const res = await fetch(`${baseUrl}/api/traces?limit=abc&offset=-3&status=bogus`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as unknown[]
-    expect(Array.isArray(body)).toBe(true)
-    expect(body.length).toBeLessThanOrEqual(100)
+    const body = (await res.json()) as { data: unknown[]; pagination: { limit: number } }
+    expect(Array.isArray(body.data)).toBe(true)
+    expect(body.data.length).toBeLessThanOrEqual(100)
+    expect(body.pagination.limit).toBe(20) // default limit
   })
 })
 
@@ -266,8 +273,8 @@ describe('trace API usage fields', () => {
     await seedTraceWithUsage('list-round-trip', { promptTokens: 150, completionTokens: 75, totalCost: 0.00225 })
     const res = await fetch(`${baseUrl}/api/traces`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as Array<{ name: string; spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>
-    const found = body.find((t) => t.name === 'list-round-trip')
+    const body = (await res.json()) as { data: Array<{ name: string; spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const found = body.data.find((t) => t.name === 'list-round-trip')
     expect(found).toBeDefined()
     expect(found?.spans[0]?.usage).toEqual({ promptTokens: 150, completionTokens: 75, totalCost: 0.00225 })
   })
@@ -285,9 +292,9 @@ describe('trace API usage fields', () => {
     await seedTraceWithUsage('mixed-with-usage', { promptTokens: 300, completionTokens: 150, totalCost: 0.0045 })
     const res = await fetch(`${baseUrl}/api/traces`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as Array<{ name: string; spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>
-    const noUsage = body.find((t) => t.name === 'mixed-no-usage')
-    const withUsage = body.find((t) => t.name === 'mixed-with-usage')
+    const body = (await res.json()) as { data: Array<{ name: string; spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const noUsage = body.data.find((t) => t.name === 'mixed-no-usage')
+    const withUsage = body.data.find((t) => t.name === 'mixed-with-usage')
     expect(noUsage?.spans[0]?.usage).toBeUndefined()
     expect(withUsage?.spans[0]?.usage).toEqual({ promptTokens: 300, completionTokens: 150, totalCost: 0.0045 })
   })
@@ -368,8 +375,9 @@ describe('trace API deletion', () => {
     const del = await fetch(`${baseUrl}/api/traces/${id}`, { method: 'DELETE' })
     expect(del.status).toBe(204)
 
-    const list = (await (await fetch(`${baseUrl}/api/traces`)).json()) as { id: string }[]
-    expect(list.some((t) => t.id === id)).toBe(false)
+    const listRes = await fetch(`${baseUrl}/api/traces`)
+    const listBody = (await listRes.json()) as { data: { id: string }[]; pagination: { total: number } }
+    expect(listBody.data.some((t) => t.id === id)).toBe(false)
 
     const byId = await fetch(`${baseUrl}/api/traces/${id}`)
     expect(byId.status).toBe(404)
@@ -479,8 +487,9 @@ describe('OpenAI chat completions proxy', () => {
     const body = await res.json()
     expect(body).toEqual(mockOpenAIResponse)
 
-    const traces = await (await fetch(`${baseUrl}/api/traces`)).json() as Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>
-    const proxyTrace = traces.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
     expect(proxyTrace).toBeDefined()
     expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gpt-4o')
     expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai')
@@ -508,8 +517,9 @@ describe('OpenAI chat completions proxy', () => {
     const res = await makeProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
     expect(res.status).toBe(429)
 
-    const traces = await (await fetch(`${baseUrl}/api/traces`)).json() as Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>
-    const errorTrace = traces.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
     expect(errorTrace).toBeDefined()
     expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
     expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai')
@@ -528,8 +538,9 @@ describe('OpenAI chat completions proxy', () => {
     const res = await makeProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
     expect(res.status).toBe(502)
 
-    const traces = await (await fetch(`${baseUrl}/api/traces`)).json() as Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>
-    const errorTrace = traces.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
     expect(errorTrace).toBeDefined()
     expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
   })
