@@ -39,7 +39,9 @@ const MAX_TRACE_LIST_LIMIT = 100
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(MAX_TRACE_LIST_LIMIT).catch(MAX_TRACE_LIST_LIMIT),
   offset: z.coerce.number().int().nonnegative().catch(0),
-  status: z.enum(['ok', 'error']).optional().catch(undefined)
+  status: z.enum(['ok', 'error']).optional().catch(undefined),
+  sessionId: z.string().max(128).optional().catch(undefined),
+  userId: z.string().max(128).optional().catch(undefined)
 })
 
 app.get('/api/traces', (c) => c.json(store.list(listQuerySchema.parse(c.req.query()))))
