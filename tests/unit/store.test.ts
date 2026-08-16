@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { TraceStore } from '../../src/domain/store.js'
 import type { Trace } from '../../src/domain/trace.js'
+import Database from 'better-sqlite3'
 
-function makeTrace(startTime: string, name = 'trace'): Trace {
+function makeTrace(startTime: string, name = 'trace', spanStatus: 'ok' | 'error' = 'ok'): Trace {
   return {
     name,
     startTime,
@@ -16,7 +17,7 @@ function makeTrace(startTime: string, name = 'trace'): Trace {
         name: 'llm-call',
         startTime,
         endTime: new Date(Date.parse(startTime) + 500).toISOString(),
-        status: 'ok'
+        status: spanStatus
       }
     ]
   }
@@ -57,6 +58,50 @@ describe('TraceStore (in-memory)', () => {
 
   it('returns an empty list when empty', () => {
     expect(store.list()).toEqual([])
+  })
+
+  it('paginates with limit and offset', () => {
+    for (let i = 0; i < 15; i += 1) {
+      store.add(makeTrace(`2026-08-15T${String(i).padStart(2, '0')}:00:00.000Z`, `trace-${i}`))
+    }
+
+    const page1 = store.list({ limit: 10 })
+    expect(page1).toHaveLength(10)
+    expect(page1[0]?.name).toBe('trace-14')
+
+    const page2 = store.list({ limit: 10, offset: 10 })
+    expect(page2).toHaveLength(5)
+    const page1Ids = new Set(page1.map((t) => t.id))
+    expect(page2.every((t) => !page1Ids.has(t.id))).toBe(true)
+  })
+
+  it('supports offset without a limit', () => {
+    store.add(makeTrace('2026-08-15T08:00:00.000Z', 'first'))
+    store.add(makeTrace('2026-08-15T09:00:00.000Z', 'second'))
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'third'))
+    expect(store.list({ offset: 1 }).map((t) => t.name)).toEqual(['second', 'first'])
+  })
+
+  it('filters by derived trace status', () => {
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'ok-trace', 'ok'))
+    store.add(makeTrace('2026-08-15T11:00:00.000Z', 'error-trace', 'error'))
+    store.add(makeTrace('2026-08-15T12:00:00.000Z', 'ok-trace-2', 'ok'))
+
+    expect(store.list({ status: 'error' }).map((t) => t.name)).toEqual(['error-trace'])
+    expect(store.list({ status: 'ok' }).map((t) => t.name)).toEqual(['ok-trace-2', 'ok-trace'])
+  })
+
+  it('combines the status filter with pagination', () => {
+    for (let i = 0; i < 5; i += 1) {
+      store.add(makeTrace(`2026-08-15T${String(i).padStart(2, '0')}:00:00.000Z`, `ok-${i}`, 'ok'))
+    }
+    for (let i = 0; i < 5; i += 1) {
+      store.add(makeTrace(`2026-08-15T${String(10 + i).padStart(2, '0')}:00:00.000Z`, `err-${i}`, 'error'))
+    }
+
+    const page = store.list({ limit: 3, offset: 2, status: 'error' })
+    expect(page).toHaveLength(3)
+    expect(page.every((t) => t.name.startsWith('err-'))).toBe(true)
   })
 })
 
@@ -126,6 +171,55 @@ describe('TraceStore (SQLite file-backed)', () => {
     const store = new TraceStore({ dbPath })
     expect(store.list()).toEqual([])
     expect(store.size).toBe(0)
+    store.close()
+  })
+
+  it('backfills the status column for databases created before filtering support', () => {
+    // Simulate a pre-pagination database: raw better-sqlite3 with the old schema.
+    const legacy = new Database(dbPath)
+    legacy.exec(`
+      CREATE TABLE traces (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        startTime    TEXT NOT NULL,
+        endTime      TEXT NOT NULL,
+        startEpochMs INTEGER NOT NULL,
+        data         TEXT NOT NULL
+      )
+    `)
+    const legacyTrace = {
+      id: 'legacy-err',
+      name: 'legacy',
+      startTime: '2026-08-15T10:00:00.000Z',
+      endTime: '2026-08-15T10:00:01.000Z',
+      spans: [
+        {
+          id: 's',
+          name: 'x',
+          startTime: '2026-08-15T10:00:00.000Z',
+          endTime: '2026-08-15T10:00:00.500Z',
+          status: 'error'
+        }
+      ]
+    }
+    legacy
+      .prepare(
+        `INSERT INTO traces (id, name, startTime, endTime, startEpochMs, data)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        legacyTrace.id,
+        legacyTrace.name,
+        legacyTrace.startTime,
+        legacyTrace.endTime,
+        Date.parse(legacyTrace.startTime),
+        JSON.stringify(legacyTrace),
+      )
+    legacy.close()
+
+    const store = new TraceStore({ dbPath })
+    expect(store.list({ status: 'error' }).map((t) => t.id)).toEqual(['legacy-err'])
+    expect(store.list({ status: 'ok' })).toEqual([])
     store.close()
   })
 })
