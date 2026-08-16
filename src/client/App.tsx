@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Span, Trace } from '../domain/trace'
 import {
   spanDurationMs,
@@ -21,6 +21,7 @@ const SORT_OPTIONS = [
   { key: 'durationMs', label: 'Duration' },
   { key: 'name', label: 'Service' },
   { key: 'operation', label: 'Operation' },
+  { key: 'sessionId', label: 'Session' },
   { key: 'status', label: 'Status' }
 ] as const
 
@@ -33,10 +34,13 @@ interface FilterState {
   status: 'all' | 'ok' | 'error'
   startTimeGte: string
   startTimeLte: string
+  sessionId: string
+  userId: string
   sort: SortKey
   sortDir: SortDir
   page: number
   pageSize: number
+  groupBySession: boolean
 }
 
 const initialFilters: FilterState = {
@@ -45,10 +49,13 @@ const initialFilters: FilterState = {
   status: 'all',
   startTimeGte: '',
   startTimeLte: '',
+  sessionId: '',
+  userId: '',
   sort: 'startTime',
   sortDir: 'desc',
   page: 1,
-  pageSize: DEFAULT_PAGE_SIZE
+  pageSize: DEFAULT_PAGE_SIZE,
+  groupBySession: false
 }
 
 function TraceRow({
@@ -130,6 +137,7 @@ function FilterBar({
   loading,
   serviceNames,
   operationNames,
+  sessionNames,
   onClear
 }: {
   filters: FilterState
@@ -137,6 +145,7 @@ function FilterBar({
   loading: boolean
   serviceNames: string[]
   operationNames: string[]
+  sessionNames: string[]
   onClear: () => void
 }) {
   const hasActiveFilters = useMemo(
@@ -145,12 +154,14 @@ function FilterBar({
       filters.operationName !== '' ||
       filters.status !== 'all' ||
       filters.startTimeGte !== '' ||
-      filters.startTimeLte !== '',
+      filters.startTimeLte !== '' ||
+      filters.sessionId !== '' ||
+      filters.userId !== '',
     [filters]
   )
 
   const handleFilterChange = useCallback(
-    (key: keyof FilterState, value: string) => {
+    (key: keyof FilterState, value: string | boolean) => {
       onChange({ [key]: value, page: 1 })
     },
     [onChange]
@@ -210,6 +221,41 @@ function FilterBar({
         </select>
       </div>
 
+      <div className="filter-group">
+        <label htmlFor="filter-session" className="sr-only">
+          Session ID
+        </label>
+        <select
+          id="filter-session"
+          value={filters.sessionId}
+          onChange={(e) => handleFilterChange('sessionId', e.target.value)}
+          disabled={loading}
+          className="filter-input"
+        >
+          <option value="">All sessions</option>
+          {sessionNames.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className="filter-group">
+        <label htmlFor="filter-user" className="sr-only">
+          User ID
+        </label>
+        <input
+          id="filter-user"
+          type="text"
+          placeholder="User ID…"
+          value={filters.userId}
+          onChange={(e) => handleFilterChange('userId', e.target.value)}
+          disabled={loading}
+          className="filter-input"
+        />
+      </div>
+
       <div className="filter-group time-range">
         <label htmlFor="filter-start-time" className="sr-only">
           Start time
@@ -240,6 +286,19 @@ function FilterBar({
           disabled={loading}
           className="filter-input time-input"
         />
+      </div>
+
+      <div className="filter-group group-toggle">
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={filters.groupBySession}
+            onChange={(e) => handleFilterChange('groupBySession', e.target.checked)}
+            disabled={loading}
+            className="checkbox-input"
+          />
+          <span className="checkbox-text">Group by Session</span>
+        </label>
       </div>
 
       {hasActiveFilters && (
@@ -370,6 +429,7 @@ export default function App() {
   const [debouncedFilters, setDebouncedFilters] = useState<FilterState>(initialFilters)
   const [serviceNames, setServiceNames] = useState<string[]>([])
   const [operationNames, setOperationNames] = useState<string[]>([])
+  const [sessionNames, setSessionNames] = useState<string[]>([])
 
   // Debounce filter changes
   useEffect(() => {
@@ -382,12 +442,15 @@ export default function App() {
   useEffect(() => {
     const services = new Set<string>()
     const operations = new Set<string>()
+    const sessions = new Set<string>()
     for (const trace of traces) {
       services.add(trace.name)
       if (trace.spans[0]) operations.add(trace.spans[0].name)
+      if (trace.sessionId) sessions.add(trace.sessionId)
     }
     setServiceNames(Array.from(services).sort())
     setOperationNames(Array.from(operations).sort())
+    setSessionNames(Array.from(sessions).sort())
   }, [traces])
 
   // Fetch traces with debounced filters
@@ -400,6 +463,8 @@ export default function App() {
     if (debouncedFilters.serviceName) params.set('serviceName', debouncedFilters.serviceName)
     if (debouncedFilters.operationName) params.set('operationName', debouncedFilters.operationName)
     if (debouncedFilters.status !== 'all') params.set('status', debouncedFilters.status)
+    if (debouncedFilters.sessionId) params.set('sessionId', debouncedFilters.sessionId)
+    if (debouncedFilters.userId) params.set('userId', debouncedFilters.userId)
     if (debouncedFilters.startTimeGte) params.set('startTimeGte', debouncedFilters.startTimeGte)
     if (debouncedFilters.startTimeLte) params.set('startTimeLte', debouncedFilters.startTimeLte)
     if (debouncedFilters.sort && debouncedFilters.sortDir) {
@@ -492,6 +557,7 @@ export default function App() {
             loading={loading}
             serviceNames={serviceNames}
             operationNames={operationNames}
+            sessionNames={sessionNames}
             onClear={clearFilters}
           />
 
@@ -502,7 +568,9 @@ export default function App() {
               debouncedFilters.operationName ||
               debouncedFilters.status !== 'all' ||
               debouncedFilters.startTimeGte ||
-              debouncedFilters.startTimeLte
+              debouncedFilters.startTimeLte ||
+              debouncedFilters.sessionId ||
+              debouncedFilters.userId
                 ? 'No traces match this filter.'
                 : 'No traces yet. POST one to /api/traces.'}
             </p>
@@ -527,25 +595,117 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {traces.map((t) => (
-                      <tr
-                        key={t.id}
-                        className={selected?.id === t.id ? 'active' : ''}
-                        onClick={() => void selectTrace(t.id!)}
-                        role="row"
-                        aria-selected={selected?.id === t.id}
-                      >
-                        <td>{new Date(t.startTime).toLocaleTimeString()}</td>
-                        <td>{fmtMs(traceDurationMs(t))}</td>
-                        <td>{t.name}</td>
-                        <td>{t.spans[0]?.name ?? '—'}</td>
-                        <td>
-                          <span className={`status-badge ${traceStatus(t)}`}>
-                            {traceStatus(t).toUpperCase()}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                    {debouncedFilters.groupBySession ? (
+                      (() => {
+                        const groups = new Map<string, Trace[]>()
+                        for (const t of traces) {
+                          const key = t.sessionId ?? '__no_session__'
+                          if (!groups.has(key)) groups.set(key, [])
+                          groups.get(key)!.push(t)
+                        }
+                        return Array.from(groups.entries()).map(([sessionId, groupTraces]) => (
+                          <React.Fragment key={sessionId}>
+                            <tr className="group-header">
+                              <td colSpan={SORT_OPTIONS.length}>
+                                <span className="group-label">
+                                  {sessionId === '__no_session__' ? (
+                                    <span className="no-session">No Session</span>
+                                  ) : (
+                                    <>
+                                      <button
+                                        type="button"
+                                        className="session-link"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleFilterChange({ sessionId, page: 1 })
+                                        }}
+                                        aria-label={`Filter by session ${sessionId}`}
+                                      >
+                                        {sessionId}
+                                      </button>
+                                      <span className="group-count">({groupTraces.length} trace{groupTraces.length === 1 ? '' : 's'})</span>
+                                    </>
+                                  )}
+                                </span>
+                              </td>
+                            </tr>
+                            {groupTraces.map((t) => (
+                              <tr
+                                key={t.id}
+                                className={selected?.id === t.id ? 'active' : ''}
+                                onClick={() => void selectTrace(t.id!)}
+                                role="row"
+                                aria-selected={selected?.id === t.id}
+                              >
+                                <td>{new Date(t.startTime).toLocaleTimeString()}</td>
+                                <td>{fmtMs(traceDurationMs(t))}</td>
+                                <td>{t.name}</td>
+                                <td>{t.spans[0]?.name ?? '—'}</td>
+                                <td>
+                                  {t.sessionId ? (
+                                    <button
+                                      type="button"
+                                      className="session-link"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleFilterChange({ sessionId: t.sessionId!, page: 1 })
+                                      }}
+                                      aria-label={`Filter by session ${t.sessionId}`}
+                                    >
+                                      {t.sessionId}
+                                    </button>
+                                  ) : (
+                                    <span className="no-session">—</span>
+                                  )}
+                                </td>
+                                <td>
+                                  <span className={`status-badge ${traceStatus(t)}`}>
+                                    {traceStatus(t).toUpperCase()}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </React.Fragment>
+                        ))
+                      })()
+                    ) : (
+                      traces.map((t) => (
+                        <tr
+                          key={t.id}
+                          className={selected?.id === t.id ? 'active' : ''}
+                          onClick={() => void selectTrace(t.id!)}
+                          role="row"
+                          aria-selected={selected?.id === t.id}
+                        >
+                          <td>{new Date(t.startTime).toLocaleTimeString()}</td>
+                          <td>{fmtMs(traceDurationMs(t))}</td>
+                          <td>{t.name}</td>
+                          <td>{t.spans[0]?.name ?? '—'}</td>
+                          <td>
+                            {t.sessionId ? (
+                              <button
+                                type="button"
+                                className="session-link"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleFilterChange({ sessionId: t.sessionId, page: 1 })
+                                }}
+                                aria-label={`Filter by session ${t.sessionId}`}
+                              >
+                                {t.sessionId}
+                              </button>
+                            ) : (
+                              <span className="no-session">—</span>
+                            )}
+                          </td>
+                          <td>
+                            <span className={`status-badge ${traceStatus(t)}`}>
+                              {traceStatus(t).toUpperCase()}
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -570,6 +730,28 @@ export default function App() {
               <p className="muted">
                 {fmtMs(traceDurationMs(selected))} · {selected.spans.length} span
                 {selected.spans.length === 1 ? '' : 's'}
+                {selected.sessionId && (
+                  <>
+                    {' · '}
+                    <button
+                      type="button"
+                      className="session-badge-link"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleFilterChange({ sessionId: selected.sessionId!, page: 1 })
+                      }}
+                      aria-label={`Filter by session ${selected.sessionId}`}
+                    >
+                      Session: {selected.sessionId}
+                    </button>
+                  </>
+                )}
+                {selected.userId && (
+                  <>
+                    {' · '}
+                    <span className="user-badge">User: {selected.userId}</span>
+                  </>
+                )}
               </p>
               <ul className="spans">
                 {selected.spans.map((s) => (
@@ -599,11 +781,16 @@ export default function App() {
         .filters-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; padding: 10px; background: #161a20; border: 1px solid #232830; border-radius: 8px; }
         .filter-group { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 140px; }
         .filter-group.time-range { flex-direction: row; align-items: center; gap: 6px; min-width: auto; }
+        .filter-group.group-toggle { flex-direction: row; align-items: center; gap: 6px; min-width: auto; }
         .time-input { width: 160px; }
         .time-sep { color: #8b949e; font-size: 12px; }
         .filter-input { background: #0f1115; border: 1px solid #232830; color: #e6e8eb; border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px; }
         .filter-input:focus { outline: none; border-color: #4c8bf5; }
         .filter-input:disabled { opacity: .6; cursor: not-allowed; }
+        .checkbox-label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; color: #e6e8eb; }
+        .checkbox-input { width: 16px; height: 16px; accent-color: #4c8bf5; }
+        .checkbox-input:disabled { opacity: .6; cursor: not-allowed; }
+        .checkbox-text { user-select: none; }
         .clear-filters { background: #232830; border: 1px solid #38444d; color: #a5d6ff; border-radius: 6px; padding: 6px 12px; font: inherit; font-size: 12px; cursor: pointer; margin-top: 18px; }
         .clear-filters:hover { background: #3d1d1d; border-color: #7f2b2b; color: #ffb4b4; }
         .loading { text-align: center; padding: 20px; }
@@ -617,9 +804,21 @@ export default function App() {
         .trace-table tbody tr { background: #161a20; transition: background .1s; }
         .trace-table tbody tr:hover { background: #1a2130; }
         .trace-table tbody tr.active { background: #1a2130; border-left: 3px solid #4c8bf5; }
+        .trace-table tbody tr.group-header { background: #1a1f2a; border-bottom: 2px solid #2a3542; }
+        .trace-table tbody tr.group-header td { padding: 8px 12px; }
+        .group-label { display: flex; align-items: center; gap: 8px; }
+        .group-count { color: #8b949e; font-size: 12px; }
+        .session-link { background: none; border: none; color: #a5d6ff; font: inherit; font-size: 13px; cursor: pointer; padding: 0; text-decoration: underline; text-decoration-style: dotted; }
+        .session-link:hover { color: #c8e1ff; text-decoration-style: solid; }
+        .session-link:focus { outline: none; color: #c8e1ff; }
+        .no-session { color: #4a525a; font-style: italic; }
         .status-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
         .status-badge.ok { background: #1f3d2e; color: #2f9e44; }
         .status-badge.error { background: #3d1d1d; color: #e03131; }
+        .session-badge-link { background: none; border: none; color: #a5d6ff; font: inherit; font-size: 13px; cursor: pointer; padding: 0; text-decoration: underline; text-decoration-style: dotted; }
+        .session-badge-link:hover { color: #c8e1ff; text-decoration-style: solid; }
+        .session-badge-link:focus { outline: none; color: #c8e1ff; }
+        .user-badge { color: #ffa657; font-size: 13px; }
         .spans { list-style: none; padding: 0; margin: 0; }
         .span { display: flex; justify-content: space-between; gap: 12px; background: #161a20; border: 1px solid #232830; border-left: 3px solid #2f9e44; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px; }
         .span.error { border-left-color: #e03131; }
@@ -638,6 +837,8 @@ export default function App() {
         @media (max-width: 600px) {
           .filters-bar { flex-direction: column; align-items: stretch; }
           .filter-group { min-width: 0; }
+          .filter-group.time-range { flex-direction: column; align-items: stretch; }
+          .filter-group.group-toggle { justify-content: flex-start; }
           .time-input { width: 100%; }
           .pager { flex-direction: column; align-items: stretch; }
           .page-nav { width: 100%; justify-content: space-between; }
