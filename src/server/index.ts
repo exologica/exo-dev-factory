@@ -51,6 +51,13 @@ app.get('/api/traces/:id', (c) => {
   return c.json(trace)
 })
 
+app.delete('/api/traces/:id', (c) => {
+  if (!store.delete(c.req.param('id'))) {
+    return c.json({ error: 'trace not found' }, 404)
+  }
+  return c.body(null, 204)
+})
+
 app.use('*', serveStatic({ root: './dist/client' }))
 app.get('*', (c) => c.text('not found', 404))
 

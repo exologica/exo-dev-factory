@@ -66,6 +66,9 @@ status is derived from its spans: `error` when any span failed, otherwise
 
 `GET /api/traces/:id` returns a single trace, or `404` when unknown.
 
+`DELETE /api/traces/:id` permanently removes a trace and returns `204`.
+Deleting an unknown id returns `404`.
+
 ## Security
 
 Report vulnerabilities privately via
