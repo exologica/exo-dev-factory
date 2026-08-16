@@ -13,6 +13,9 @@ import { pricingEngine } from '../domain/pricing.js'
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
 const ANTHROPIC_API_VERSION = '2023-06-01'
 
+// Google Gemini API constants
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
+
 // Durable by default: traces survive restarts in a local SQLite file. The
 // location is deterministic and documented (README); override with
 // TRACE_DB_PATH, or pass ':memory:' for a throwaway in-memory database.
@@ -335,6 +338,119 @@ app.post('/v1/proxy/anthropic/messages', async (c) => {
         usage: {
           promptTokens: inputTokens,
           completionTokens: outputTokens,
+          totalCost
+        }
+      }
+    ]
+  }
+
+  store.add(trace)
+
+  return new Response(JSON.stringify(responseBody), {
+    status: response.status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  })
+})
+
+// Google Gemini chat completions proxy
+app.post('/v1/proxy/gemini/generateContent', async (c) => {
+  const apiKey = c.req.header('x-goog-api-key') || c.req.header('authorization')?.replace('Bearer ', '')
+  if (!apiKey) {
+    return c.json({ error: 'missing or invalid x-goog-api-key header' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  // Extract model from request body (Google format: models/{model}:generateContent)
+  const model = typeof body.model === 'string' ? body.model : 'gemini-1.5-pro'
+  const geminiUrl = `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`
+
+  const startTime = new Date().toISOString()
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      contents: body.contents,
+      generationConfig: body.generationConfig,
+      safetySettings: body.safetySettings
+    })
+  }
+
+  let response: Response
+  try {
+    response = await fetch(geminiUrl, requestInit)
+  } catch (err) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-gemini-generateContent',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': err instanceof Error ? err.message : 'unknown error',
+            'proxy.upstream': 'google'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream request failed' }, 502)
+  }
+
+  const endTime = new Date().toISOString()
+  const responseBody = (await response.clone().json().catch(() => ({}))) as {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{ text?: string }>
+      }
+    }>
+    usageMetadata?: {
+      promptTokenCount?: number
+      candidatesTokenCount?: number
+      totalTokenCount?: number
+    }
+    modelVersion?: string
+  }
+
+  const modelName = typeof responseBody.modelVersion === 'string' ? responseBody.modelVersion : 'unknown'
+  const promptTokens = typeof responseBody.usageMetadata?.promptTokenCount === 'number' ? responseBody.usageMetadata.promptTokenCount : 0
+  const completionTokens = typeof responseBody.usageMetadata?.candidatesTokenCount === 'number' ? responseBody.usageMetadata.candidatesTokenCount : 0
+
+  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, modelName)
+  const totalCost = totalCostCents / 100
+
+  const trace: Trace = {
+    name: 'proxy-gemini-generateContent',
+    startTime,
+    endTime,
+    spans: [
+      {
+        id: crypto.randomUUID(),
+        name: 'llm-call',
+        startTime,
+        endTime,
+        status: response.ok ? 'ok' : 'error',
+        attributes: {
+          'llm.model': modelName,
+          'proxy.upstream': 'google',
+          'http.status': response.status
+        },
+        usage: {
+          promptTokens,
+          completionTokens,
           totalCost
         }
       }
