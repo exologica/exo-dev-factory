@@ -129,6 +129,15 @@ export class TraceStore {
     return row.n
   }
 
+  /**
+   * Permanently removes a trace by id. Returns true when a trace was deleted,
+   * false when no trace with that id existed.
+   */
+  delete(id: string): boolean {
+    const result = this.db.prepare('DELETE FROM traces WHERE id = ?').run(id)
+    return result.changes > 0
+  }
+
   /** Close the underlying SQLite database. Safe to call once, after which the store is unusable. */
   close(): void {
     this.db.close()

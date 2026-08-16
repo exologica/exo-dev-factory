@@ -60,6 +60,31 @@ describe('TraceStore (in-memory)', () => {
     expect(store.list()).toEqual([])
   })
 
+  it('deletes an existing trace and reports success', () => {
+    const id = store.add(makeTrace('2026-08-15T10:00:00.000Z', 'doomed'))
+    expect(store.delete(id)).toBe(true)
+    expect(store.get(id)).toBeUndefined()
+    expect(store.list().map((t) => t.name)).toEqual([])
+    expect(store.size).toBe(0)
+  })
+
+  it('reports not-found when deleting an unknown id', () => {
+    store.add(makeTrace('2026-08-15T10:00:00.000Z', 'keeper'))
+    expect(store.delete('no-such-id')).toBe(false)
+    expect(store.size).toBe(1)
+  })
+
+  it('leaves unrelated traces intact when deleting one trace', () => {
+    const first = store.add(makeTrace('2026-08-15T08:00:00.000Z', 'first'))
+    const second = store.add(makeTrace('2026-08-15T09:00:00.000Z', 'second'))
+    const third = store.add(makeTrace('2026-08-15T10:00:00.000Z', 'third'))
+
+    expect(store.delete(second)).toBe(true)
+    expect(store.list().map((t) => t.name)).toEqual(['third', 'first'])
+    expect(store.get(first)?.name).toBe('first')
+    expect(store.get(third)?.name).toBe('third')
+  })
+
   it('paginates with limit and offset', () => {
     for (let i = 0; i < 15; i += 1) {
       store.add(makeTrace(`2026-08-15T${String(i).padStart(2, '0')}:00:00.000Z`, `trace-${i}`))
