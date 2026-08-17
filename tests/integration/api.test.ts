@@ -739,6 +739,162 @@ describe('OpenAI chat completions proxy', () => {
   })
 })
 
+describe('OpenAI Responses API proxy', () => {
+  const mockResponsesResponse = {
+    id: 'resp_test',
+    object: 'response',
+    created_at: 1723833600,
+    model: 'gpt-4o',
+    output: [
+      {
+        type: 'message',
+        id: 'msg_test',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Hello!' }]
+      }
+    ],
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      reasoning_tokens: 3,
+      total_tokens: 18
+    }
+  }
+
+  const mockErrorResponse = {
+    error: { message: 'Rate limit exceeded', type: 'rate_limit_error', code: 'rate_limit_exceeded' }
+  }
+
+  const RESPONSES_URL = 'https://api.openai.com/v1/responses'
+  const originalFetch = global.fetch
+
+  function makeResponsesProxyRequest(body: unknown, authHeader = 'Bearer test-key') {
+    return fetch(`${baseUrl}/v1/proxy/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: authHeader },
+      body: JSON.stringify(body)
+    })
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === RESPONSES_URL) {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockResponsesResponse) }),
+          json: () => Promise.resolve(mockResponsesResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns 401 when Authorization header is missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', input: 'hi' })
+    })
+    expect(res.status).toBe(401)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing or invalid Authorization header')
+  })
+
+  it('returns 401 when Authorization header is not Bearer', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Basic invalid' },
+      body: JSON.stringify({ model: 'gpt-4o', input: 'hi' })
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 400 for invalid JSON body', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: '{not json'
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid JSON body')
+  })
+
+  it('forwards request to OpenAI Responses API and returns response with trace on success', async () => {
+    const res = await makeResponsesProxyRequest({ model: 'gpt-4o', input: 'hi' })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockResponsesResponse)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gpt-4o')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai-responses')
+    expect(proxyTrace?.spans[0]?.attributes?.['openai.response_id']).toBe('resp_test')
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.usage.reasoning_tokens']).toBe(3)
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(10)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(5)
+    expect(typeof proxyTrace?.spans[0]?.usage?.totalCost).toBe('number')
+
+    // Security: Authorization header must not be in trace
+    expect(proxyTrace?.spans[0]?.attributes?.['authorization']).toBeUndefined()
+  })
+
+  it('creates error trace when upstream fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === RESPONSES_URL) {
+        return {
+          ok: false,
+          status: 429,
+          clone: () => ({ json: () => Promise.resolve(mockErrorResponse) }),
+          json: () => Promise.resolve(mockErrorResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeResponsesProxyRequest({ model: 'gpt-4o', input: 'hi' })
+    expect(res.status).toBe(429)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai-responses')
+    expect(errorTrace?.spans[0]?.attributes?.['http.status']).toBe(429)
+  })
+
+  it('creates error trace when network request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === RESPONSES_URL) {
+        throw new Error('ENOTFOUND')
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeResponsesProxyRequest({ model: 'gpt-4o', input: 'hi' })
+    expect(res.status).toBe(502)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai-responses')
+  })
+})
+
 describe('Anthropic chat completions proxy', () => {
   const mockAnthropicResponse = {
     id: 'msg_test',
