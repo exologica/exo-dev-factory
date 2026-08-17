@@ -23,6 +23,8 @@ const URL_PARAM_KEYS = {
   status: 'status',
   startTimeGte: 'startTimeGte',
   startTimeLte: 'startTimeLte',
+  sessionId: 'sessionId',
+  userId: 'userId',
   page: 'page',
   limit: 'limit',
   sort: 'sort',
@@ -36,6 +38,8 @@ function filtersToSearchParams(filters: FilterState): URLSearchParams {
   if (filters.status !== 'all') params.set(URL_PARAM_KEYS.status, filters.status)
   if (filters.startTimeGte !== '') params.set(URL_PARAM_KEYS.startTimeGte, filters.startTimeGte)
   if (filters.startTimeLte !== '') params.set(URL_PARAM_KEYS.startTimeLte, filters.startTimeLte)
+  if (filters.sessionId !== '') params.set(URL_PARAM_KEYS.sessionId, filters.sessionId)
+  if (filters.userId !== '') params.set(URL_PARAM_KEYS.userId, filters.userId)
   if (filters.page !== 1) params.set(URL_PARAM_KEYS.page, String(filters.page))
   if (filters.pageSize !== DEFAULT_PAGE_SIZE) params.set(URL_PARAM_KEYS.limit, String(filters.pageSize))
   if (filters.sort !== 'startTime') params.set(URL_PARAM_KEYS.sort, filters.sort)
@@ -66,6 +70,12 @@ function searchParamsToFilters(searchParams: URLSearchParams): Partial<FilterSta
     const parsed = Date.parse(startTimeLte)
     if (!Number.isNaN(parsed)) patch.startTimeLte = startTimeLte
   }
+  
+  const sessionId = searchParams.get(URL_PARAM_KEYS.sessionId)
+  if (sessionId !== null) patch.sessionId = sessionId
+  
+  const userId = searchParams.get(URL_PARAM_KEYS.userId)
+  if (userId !== null) patch.userId = userId
   
   const page = searchParams.get(URL_PARAM_KEYS.page)
   if (page !== null) {
