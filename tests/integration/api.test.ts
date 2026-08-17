@@ -1875,3 +1875,372 @@ describe('cost aggregation API', () => {
     expect(body.totalCostCents).toBeGreaterThanOrEqual(3050)
   })
 })
+
+describe('Generic passthrough proxy', () => {
+  const mockOpenAIResponse = {
+    id: 'chatcmpl-test',
+    object: 'chat.completion',
+    created: 1723833600,
+    model: 'gpt-4o',
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: 'Hello!' },
+        finish_reason: 'stop'
+      }
+    ],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+  }
+
+  const mockErrorResponse = {
+    error: { message: 'Rate limit exceeded', type: 'rate_limit_error', code: 'rate_limit_exceeded' }
+  }
+
+  const originalFetch = global.fetch
+
+  function makePassthroughRequest(
+    upstreamPath: string,
+    body: unknown,
+    headers: Record<string, string> = {
+      'content-type': 'application/json',
+      authorization: 'Bearer test-key'
+    }
+  ) {
+    return fetch(`${baseUrl}/v1/proxy/passthrough/${upstreamPath}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    })
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.openai.com/v1/chat/completions') {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockOpenAIResponse) }),
+          json: () => Promise.resolve(mockOpenAIResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns 400 when upstream path is missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing upstream path')
+  })
+
+  it('returns 400 for invalid JSON body', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/api.openai.com/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: '{not json'
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid JSON body')
+  })
+
+  it('blocks localhost (SSRF prevention)', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/localhost:8080/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('blocked hostname')
+  })
+
+  it('blocks 127.0.0.1 (SSRF prevention)', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/127.0.0.1:8080/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('private IP range blocked')
+  })
+
+  it('blocks 169.254.169.254 metadata endpoint (SSRF prevention)', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/169.254.169.254/latest/meta-data`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('blocked hostname')
+  })
+
+  it('blocks metadata.google.internal (SSRF prevention)', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/metadata.google.internal/computeMetadata/v1/instance/id`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('blocked hostname')
+  })
+
+  it('allows valid public hostname', async () => {
+    const res = await makePassthroughRequest('api.openai.com/v1/chat/completions', { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockOpenAIResponse)
+  })
+
+  it('forwards request to upstream and returns response with trace on success', async () => {
+    const res = await makePassthroughRequest('api.openai.com/v1/chat/completions', { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockOpenAIResponse)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gpt-4o')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('generic-passthrough')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream.host']).toBe('api.openai.com')
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(10)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(5)
+    expect(typeof proxyTrace?.spans[0]?.usage?.totalCost).toBe('number')
+
+    // Security: Authorization header must not be in trace
+    expect(proxyTrace?.spans[0]?.attributes?.['authorization']).toBeUndefined()
+  })
+
+  it('creates error trace when upstream fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.openai.com/v1/chat/completions') {
+        return {
+          ok: false,
+          status: 429,
+          clone: () => ({ json: () => Promise.resolve(mockErrorResponse) }),
+          json: () => Promise.resolve(mockErrorResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makePassthroughRequest('api.openai.com/v1/chat/completions', { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(429)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('generic-passthrough')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream.host']).toBe('api.openai.com')
+    expect(errorTrace?.spans[0]?.attributes?.['http.status']).toBe(429)
+  })
+
+  it('creates error trace when network request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.openai.com/v1/chat/completions') {
+        throw new Error('ENOTFOUND')
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makePassthroughRequest('api.openai.com/v1/chat/completions', { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(502)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('generic-passthrough')
+  })
+
+  it('passes through Authorization header to upstream', async () => {
+    let capturedAuthHeader: string | null = null
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.openai.com/v1/chat/completions') {
+        const headers = init?.headers
+        if (headers && typeof headers === 'object' && 'authorization' in headers) {
+          const auth = (headers as Record<string, string | undefined>).authorization
+          capturedAuthHeader = auth ?? null
+        } else {
+          capturedAuthHeader = null
+        }
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockOpenAIResponse) }),
+          json: () => Promise.resolve(mockOpenAIResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makePassthroughRequest('api.openai.com/v1/chat/completions', { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }, {
+      'content-type': 'application/json',
+      authorization: 'Bearer custom-key-123'
+    })
+    expect(res.status).toBe(200)
+    expect(capturedAuthHeader).toBe('Bearer custom-key-123')
+  })
+
+  it('passes through api-key header to upstream', async () => {
+    let capturedApiKey: string | null = null
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.openai.com/v1/chat/completions') {
+        const headers = init?.headers
+        if (headers && typeof headers === 'object' && 'api-key' in headers) {
+          const apiKey = (headers as Record<string, string | undefined>)['api-key']
+          capturedApiKey = apiKey ?? null
+        } else {
+          capturedApiKey = null
+        }
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockOpenAIResponse) }),
+          json: () => Promise.resolve(mockOpenAIResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/api.openai.com/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'api-key': 'test-api-key-456'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(200)
+    expect(capturedApiKey).toBe('test-api-key-456')
+  })
+
+  it('preserves query parameters in upstream URL', async () => {
+    let capturedUrl: string | null = null
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith('https://api.openai.com/v1/chat/completions')) {
+        capturedUrl = urlStr
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockOpenAIResponse) }),
+          json: () => Promise.resolve(mockOpenAIResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/api.openai.com/v1/chat/completions?custom_param=test&foo=bar`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(200)
+    expect(capturedUrl).toContain('custom_param=test')
+    expect(capturedUrl).toContain('foo=bar')
+  })
+
+  it('handles Anthropic-compatible upstream', async () => {
+    const mockAnthropicResponse = {
+      id: 'msg_test',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Hello!' }],
+      model: 'claude-3-5-sonnet-20241022',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 12, output_tokens: 8 }
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.anthropic.com/v1/messages') {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockAnthropicResponse) }),
+          json: () => Promise.resolve(mockAnthropicResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/api.anthropic.com/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test-key' },
+      body: JSON.stringify({ model: 'claude-3-5-sonnet-20241022', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(200)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('claude-3-5-sonnet-20241022')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('generic-passthrough')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream.host']).toBe('api.anthropic.com')
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(12)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(8)
+  })
+
+  it('handles Cohere-compatible upstream', async () => {
+    const mockCohereResponse = {
+      text: 'Hello!',
+      generationId: 'gen-test',
+      meta: { tokens: { inputTokens: 8, outputTokens: 6 } },
+      model: 'command-r-plus'
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === 'https://api.cohere.com/v1/chat') {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockCohereResponse) }),
+          json: () => Promise.resolve(mockCohereResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await fetch(`${baseUrl}/v1/proxy/passthrough/api.cohere.com/v1/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ message: 'hi', model: 'command-r-plus' })
+    })
+    expect(res.status).toBe(200)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('command-r-plus')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('generic-passthrough')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream.host']).toBe('api.cohere.com')
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(8)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(6)
+  })
+})

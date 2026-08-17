@@ -27,6 +27,140 @@ const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions'
 const AZURE_API_VERSION = '2024-02-15-preview'
 const AZURE_BASE_HOST = 'openai.azure.com'
 
+// Generic passthrough proxy constants
+const PRIVATE_IP_RANGES = [
+  /^10\./,                    // 10.0.0.0/8
+  /^127\./,                   // 127.0.0.0/8 (localhost)
+  /^169\.254\./,              // 169.254.0.0/16 (link-local)
+  /^172\.(1[6-9]|2[0-9]|3[0-1])\./, // 172.16.0.0/12
+  /^192\.168\./,              // 192.168.0.0/16
+  /^::1$/,                    // IPv6 localhost
+  /^fe80::/,                  // IPv6 link-local
+  /^fc00::/,                  // IPv6 unique local
+  /^fd00::/                   // IPv6 unique local
+]
+
+const BLOCKED_HOSTNAMES = [
+  'localhost',
+  'localhost.localdomain',
+  'metadata.google.internal',  // GCP metadata
+  '169.254.169.254',           // AWS/Azure/GCP metadata
+  'metadata.azure.com',        // Azure metadata
+  'metadata'                   // Generic metadata
+]
+
+// SSRF protection: validate hostname against blocklist and private IP ranges
+function validateUpstreamHostname(hostname: string): { valid: boolean; error?: string } {
+  const lowerHost = hostname.toLowerCase()
+
+  // Check blocked hostnames
+  if (BLOCKED_HOSTNAMES.includes(lowerHost)) {
+    return { valid: false, error: `blocked hostname: ${hostname}` }
+  }
+
+  // Check if it's an IP address (IPv4 or IPv6)
+  const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/
+  const ipv6Pattern = /^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^fe80::/
+
+  if (ipv4Pattern.test(hostname) || ipv6Pattern.test(hostname)) {
+    for (const range of PRIVATE_IP_RANGES) {
+      if (range.test(hostname)) {
+        return { valid: false, error: `private IP range blocked: ${hostname}` }
+      }
+    }
+  }
+
+  // Basic hostname validation (RFC 1123)
+  const hostnamePattern = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/
+  if (!hostnamePattern.test(hostname)) {
+    return { valid: false, error: `invalid hostname format: ${hostname}` }
+  }
+
+  return { valid: true }
+}
+
+// Extract upstream URL from path param and query string
+function buildUpstreamUrl(upstreamPath: string, query: Record<string, string | undefined>): string {
+  // upstreamPath is the path part after /v1/proxy/passthrough/
+  // e.g., if request is to /v1/proxy/passthrough/api.openai.com/v1/chat/completions?model=gpt-4o
+  // then upstreamPath = "api.openai.com/v1/chat/completions"
+  // We need to reconstruct: https://api.openai.com/v1/chat/completions?model=gpt-4o
+
+  const [hostname, ...pathParts] = upstreamPath.split('/')
+  const path = pathParts.length > 0 ? '/' + pathParts.join('/') : '/'
+
+  // Build query string from request query params
+  const searchParams = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined) {
+      searchParams.set(key, value)
+    }
+  }
+  const queryString = searchParams.toString()
+
+  return `https://${hostname}${path}${queryString ? '?' + queryString : ''}`
+}
+
+// Determine upstream host from URL for trace metadata
+function extractUpstreamHost(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname
+  } catch {
+    return 'unknown'
+  }
+}
+
+// Detect model from request body for common formats
+function detectModelFromBody(body: unknown, upstreamHost: string): string {
+  if (!body || typeof body !== 'object') return 'unknown'
+
+  const b = body as Record<string, unknown>
+
+  // OpenAI/OpenAI-compatible format
+  if (typeof b.model === 'string') return b.model
+
+  // Anthropic format
+  if (typeof b.model === 'string') return b.model
+
+  // Google Gemini format: models/{model}:generateContent
+  if (upstreamHost.includes('generativelanguage.googleapis.com')) {
+    // Model is typically in the URL path, not body
+    return 'gemini'
+  }
+
+  // Cohere format
+  if (typeof b.model === 'string') return b.model
+
+  // Mistral format
+  if (typeof b.model === 'string') return b.model
+
+  return 'unknown'
+}
+
+// Headers to pass through to upstream (case-insensitive)
+const PASSTHROUGH_HEADERS = new Set([
+  'authorization',
+  'api-key',
+  'x-api-key',
+  'x-goog-api-key',
+  'x-azure-resource',
+  'x-azure-deployment',
+  'x-azure-api-version',
+  'anthropic-version',
+  'content-type'
+])
+
+// Headers that should never be logged in traces
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'api-key',
+  'x-api-key',
+  'x-goog-api-key',
+  'cookie',
+  'set-cookie'
+])
+
 // Durable by default: traces survive restarts in a local SQLite file. The
 // location is deterministic and documented (README); override with
 // TRACE_DB_PATH, or pass ':memory:' for a throwaway in-memory database.
@@ -854,6 +988,182 @@ app.post('/v1/proxy/azure/chat/completions', async (c) => {
           'proxy.upstream': 'azure-openai',
           'http.status': response.status
         },
+        usage: {
+          promptTokens,
+          completionTokens,
+          totalCost
+        }
+      }
+    ]
+  }
+
+  store.add(trace)
+
+  return new Response(JSON.stringify(responseBody), {
+    status: response.status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  })
+})
+
+// Generic passthrough proxy route
+app.post('/v1/proxy/passthrough/', async (c) => {
+  return c.json({ error: 'missing upstream path' }, 400)
+})
+
+app.post('/v1/proxy/passthrough/**', async (c) => {
+  const fullPath = c.req.path
+  const prefix = '/v1/proxy/passthrough/'
+  if (!fullPath.startsWith(prefix)) {
+    return c.json({ error: 'missing upstream path' }, 400)
+  }
+  const upstreamPath = fullPath.slice(prefix.length)
+  if (!upstreamPath || upstreamPath.trim() === '') {
+    return c.json({ error: 'missing upstream path' }, 400)
+  }
+
+  // Build upstream URL from path param and query string
+  const query = c.req.query()
+  const upstreamUrl = buildUpstreamUrl(upstreamPath, query)
+
+  // Validate upstream hostname for SSRF protection
+  const hostname = extractUpstreamHost(upstreamUrl)
+  const validation = validateUpstreamHostname(hostname)
+  if (!validation.valid) {
+    return c.json({ error: validation.error }, 403)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  // Extract headers to pass through
+  const requestHeaders: Record<string, string> = {
+    'content-type': 'application/json'
+  }
+
+  // Pass through allowed headers (case-insensitive)
+  const headers = c.req.raw.headers
+  for (const [key, value] of headers.entries()) {
+    const lowerKey = key.toLowerCase()
+    if (PASSTHROUGH_HEADERS.has(lowerKey)) {
+      requestHeaders[key] = value
+    }
+  }
+
+  const startTime = new Date().toISOString()
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: requestHeaders,
+    body: JSON.stringify(body)
+  }
+
+  let response: Response
+  try {
+    response = await fetch(upstreamUrl, requestInit)
+  } catch (err) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-generic-passthrough',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': err instanceof Error ? err.message : 'unknown error',
+            'proxy.upstream': 'generic-passthrough',
+            'proxy.upstream.host': hostname,
+            'llm.model': 'unknown'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream request failed' }, 502)
+  }
+
+  const endTime = new Date().toISOString()
+  const responseBody = (await response.clone().json().catch(() => ({}))) as {
+    model?: string
+    usage?: {
+      prompt_tokens?: number
+      completion_tokens?: number
+      total_tokens?: number
+      input_tokens?: number
+      output_tokens?: number
+    }
+    meta?: {
+      tokens?: {
+        inputTokens?: number
+        outputTokens?: number
+      }
+    }
+    usageMetadata?: {
+      promptTokenCount?: number
+      candidatesTokenCount?: number
+      totalTokenCount?: number
+    }
+    modelVersion?: string
+  }
+
+  const isError = !response.ok
+  const model = isError ? 'unknown' : detectModelFromBody(body, hostname)
+  let promptTokens = 0
+  let completionTokens = 0
+
+  // Extract token usage from various provider response formats (only for successful responses)
+  if (!isError && responseBody.usage) {
+    // OpenAI/OpenAI-compatible format (prompt_tokens, completion_tokens)
+    if (typeof responseBody.usage.prompt_tokens === 'number' || typeof responseBody.usage.completion_tokens === 'number') {
+      promptTokens = typeof responseBody.usage.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
+      completionTokens = typeof responseBody.usage.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
+    }
+    // Anthropic format (input_tokens, output_tokens)
+    else if (typeof responseBody.usage.input_tokens === 'number' || typeof responseBody.usage.output_tokens === 'number') {
+      promptTokens = typeof responseBody.usage.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
+      completionTokens = typeof responseBody.usage.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
+    }
+  } else if (!isError && responseBody.meta?.tokens) {
+    // Cohere format
+    promptTokens = typeof responseBody.meta.tokens.inputTokens === 'number' ? responseBody.meta.tokens.inputTokens : 0
+    completionTokens = typeof responseBody.meta.tokens.outputTokens === 'number' ? responseBody.meta.tokens.outputTokens : 0
+  } else if (!isError && responseBody.usageMetadata) {
+    // Google Gemini format
+    promptTokens = typeof responseBody.usageMetadata.promptTokenCount === 'number' ? responseBody.usageMetadata.promptTokenCount : 0
+    completionTokens = typeof responseBody.usageMetadata.candidatesTokenCount === 'number' ? responseBody.usageMetadata.candidatesTokenCount : 0
+  }
+
+  // Calculate cost using pricing engine (falls back to default rates for unknown models)
+  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+  const totalCost = totalCostCents / 100
+
+  // Build trace attributes (excluding sensitive headers)
+  const traceAttributes: Record<string, unknown> = {
+    'llm.model': model,
+    'proxy.upstream': 'generic-passthrough',
+    'proxy.upstream.host': hostname,
+    'http.status': response.status
+  }
+
+  const trace: Trace = {
+    name: 'proxy-generic-passthrough',
+    startTime,
+    endTime,
+    spans: [
+      {
+        id: crypto.randomUUID(),
+        name: 'llm-call',
+        startTime,
+        endTime,
+        status: response.ok ? 'ok' : 'error',
+        attributes: traceAttributes,
         usage: {
           promptTokens,
           completionTokens,
