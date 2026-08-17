@@ -85,6 +85,15 @@ const DEFAULT_PRICING: PricingConfig = {
         'sonar-large-online': { inputCentsPerMillion: 100, outputCentsPerMillion: 100 },  // $1.00/$1.00
         'sonar-small-online': { inputCentsPerMillion: 20, outputCentsPerMillion: 20 },     // $0.20/$0.20
       }
+    },
+    azure: {
+      defaultModel: 'gpt-4o',
+      models: {
+        'gpt-4o': { inputCentsPerMillion: 250, outputCentsPerMillion: 1000 },      // $2.50/$10.00 per 1M
+        'gpt-4o-mini': { inputCentsPerMillion: 15, outputCentsPerMillion: 60 },     // $0.15/$0.60 per 1M
+        'gpt-4': { inputCentsPerMillion: 3000, outputCentsPerMillion: 6000 },       // $30.00/$60.00 per 1M
+        'gpt-35-turbo': { inputCentsPerMillion: 50, outputCentsPerMillion: 150 },   // $0.50/$1.50 per 1M
+      }
     }
   }
 }

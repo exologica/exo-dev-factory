@@ -22,6 +22,11 @@ const COHERE_URL = 'https://api.cohere.com/v1/chat'
 // Mistral API constants
 const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions'
 
+// Azure OpenAI API constants
+// Azure OpenAI endpoint format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview
+const AZURE_API_VERSION = '2024-02-15-preview'
+const AZURE_BASE_HOST = 'openai.azure.com'
+
 // Durable by default: traces survive restarts in a local SQLite file. The
 // location is deterministic and documented (README); override with
 // TRACE_DB_PATH, or pass ':memory:' for a throwaway in-memory database.
@@ -717,6 +722,136 @@ app.post('/v1/proxy/mistral/v1/chat/completions', async (c) => {
         attributes: {
           'llm.model': model,
           'proxy.upstream': 'mistral',
+          'http.status': response.status
+        },
+        usage: {
+          promptTokens,
+          completionTokens,
+          totalCost
+        }
+      }
+    ]
+  }
+
+  store.add(trace)
+
+  return new Response(JSON.stringify(responseBody), {
+    status: response.status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  })
+})
+
+// Azure OpenAI chat completions proxy
+app.post('/v1/proxy/azure/chat/completions', async (c) => {
+  const authHeader = c.req.header('authorization')
+  const apiKey = c.req.header('api-key')
+  const resource = c.req.header('x-azure-resource')
+  const deployment = c.req.header('x-azure-deployment')
+  const apiVersion = c.req.header('x-azure-api-version') || AZURE_API_VERSION
+
+  if (!authHeader && !apiKey) {
+    return c.json({ error: 'missing Authorization or api-key header' }, 401)
+  }
+
+  if (!resource || !deployment) {
+    return c.json({ error: 'missing x-azure-resource or x-azure-deployment header' }, 400)
+  }
+
+  // Validate resource and deployment names to prevent SSRF
+  const namePattern = /^[a-zA-Z0-9-]+$/
+  if (!namePattern.test(resource) || !namePattern.test(deployment)) {
+    return c.json({ error: 'invalid resource or deployment name' }, 400)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  // Construct Azure OpenAI endpoint URL
+  const azureUrl = `https://${resource}.${AZURE_BASE_HOST}/openai/deployments/${deployment}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`
+
+  const startTime = new Date().toISOString()
+  const requestHeaders: Record<string, string> = {
+    'content-type': 'application/json'
+  }
+
+  if (authHeader) {
+    requestHeaders.authorization = authHeader
+  } else if (apiKey) {
+    requestHeaders['api-key'] = apiKey
+  }
+
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: requestHeaders,
+    body: JSON.stringify(body)
+  }
+
+  let response: Response
+  try {
+    response = await fetch(azureUrl, requestInit)
+  } catch (err) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-azure-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': err instanceof Error ? err.message : 'unknown error',
+            'proxy.upstream': 'azure-openai'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream request failed' }, 502)
+  }
+
+  const endTime = new Date().toISOString()
+  const responseBody = (await response.clone().json().catch(() => ({}))) as {
+    model?: string
+    usage?: {
+      prompt_tokens?: number
+      completion_tokens?: number
+      total_tokens?: number
+    }
+  }
+
+  const requestModel = typeof body.model === 'string' ? body.model : undefined
+  const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
+  const model = response.ok
+    ? (responseModel ?? requestModel ?? 'gpt-4o')
+    : 'unknown'
+  const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
+  const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
+
+  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+  const totalCost = totalCostCents / 100
+
+  const trace: Trace = {
+    name: 'proxy-azure-chat-completions',
+    startTime,
+    endTime,
+    spans: [
+      {
+        id: crypto.randomUUID(),
+        name: 'llm-call',
+        startTime,
+        endTime,
+        status: response.ok ? 'ok' : 'error',
+        attributes: {
+          'llm.model': model,
+          'proxy.upstream': 'azure-openai',
           'http.status': response.status
         },
         usage: {
