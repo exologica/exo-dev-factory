@@ -22,6 +22,9 @@ const COHERE_URL = 'https://api.cohere.com/v1/chat'
 // Mistral API constants
 const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions'
 
+// OpenAI Responses API constants
+const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses'
+
 // Azure OpenAI API constants
 // Azure OpenAI endpoint format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview
 const AZURE_API_VERSION = '2024-02-15-preview'
@@ -861,6 +864,125 @@ app.post('/v1/proxy/mistral/v1/chat/completions', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalCost
+        }
+      }
+    ]
+  }
+
+  store.add(trace)
+
+  return new Response(JSON.stringify(responseBody), {
+    status: response.status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  })
+})
+
+// OpenAI Responses API proxy
+app.post('/v1/proxy/responses', async (c) => {
+  const authHeader = c.req.header('authorization')
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'missing or invalid Authorization header' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const startTime = new Date().toISOString()
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: authHeader
+    },
+    body: JSON.stringify(body)
+  }
+
+  let response: Response
+  try {
+    response = await fetch(OPENAI_RESPONSES_URL, requestInit)
+  } catch (err) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-openai-responses',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': err instanceof Error ? err.message : 'unknown error',
+            'proxy.upstream': 'openai-responses'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream request failed' }, 502)
+  }
+
+  const endTime = new Date().toISOString()
+  const responseBody = (await response.clone().json().catch(() => ({}))) as {
+    id?: string
+    model?: string
+    usage?: {
+      input_tokens?: number
+      output_tokens?: number
+      reasoning_tokens?: number
+      total_tokens?: number
+    }
+  }
+
+  const isError = !response.ok
+  const model = isError ? 'unknown' : (typeof responseBody.model === 'string' ? responseBody.model : 'unknown')
+  const responseId = typeof responseBody.id === 'string' ? responseBody.id : undefined
+  const inputTokens = typeof responseBody.usage?.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
+  const outputTokens = typeof responseBody.usage?.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
+  const reasoningTokens = typeof responseBody.usage?.reasoning_tokens === 'number' ? responseBody.usage.reasoning_tokens : 0
+
+  // OpenAI Responses API: total_tokens = input_tokens + output_tokens (reasoning_tokens included in output)
+  const totalTokens = typeof responseBody.usage?.total_tokens === 'number'
+    ? responseBody.usage.total_tokens
+    : inputTokens + outputTokens
+
+  const totalCostCents = pricingEngine.calculateCostCents(inputTokens, outputTokens, model)
+  const totalCost = totalCostCents / 100
+
+  const traceAttributes: Record<string, unknown> = {
+    'llm.model': model,
+    'proxy.upstream': 'openai-responses',
+    'http.status': response.status
+  }
+  if (responseId) {
+    traceAttributes['openai.response_id'] = responseId
+  }
+  if (reasoningTokens > 0) {
+    traceAttributes['llm.usage.reasoning_tokens'] = reasoningTokens
+  }
+
+  const trace: Trace = {
+    name: 'proxy-openai-responses',
+    startTime,
+    endTime,
+    spans: [
+      {
+        id: crypto.randomUUID(),
+        name: 'llm-call',
+        startTime,
+        endTime,
+        status: response.ok ? 'ok' : 'error',
+        attributes: traceAttributes,
+        usage: {
+          promptTokens: inputTokens,
+          completionTokens: outputTokens,
           totalCost
         }
       }
