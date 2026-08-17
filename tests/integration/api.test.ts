@@ -1387,6 +1387,281 @@ describe('Mistral chat completions proxy', () => {
   })
 })
 
+describe('Azure OpenAI chat completions proxy', () => {
+  const mockAzureResponse = {
+    id: 'chatcmpl-test',
+    object: 'chat.completion',
+    created: 1723833600,
+    model: 'gpt-4o',
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: 'Hello!' },
+        finish_reason: 'stop'
+      }
+    ],
+    usage: { prompt_tokens: 16, completion_tokens: 8, total_tokens: 24 }
+  }
+
+  const mockErrorResponse = {
+    error: { message: 'Rate limit exceeded', type: 'rate_limit_error', code: 'rate_limit_exceeded' }
+  }
+
+  const AZURE_URL_BASE = 'https://'
+  const originalFetch = global.fetch
+
+  function makeAzureProxyRequest(
+    body: unknown,
+    headers: Record<string, string> = {
+      'content-type': 'application/json',
+      authorization: 'Bearer test-key',
+      'x-azure-resource': 'my-resource',
+      'x-azure-deployment': 'my-deployment'
+    }
+  ) {
+    return fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body)
+    })
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${AZURE_URL_BASE}my-resource.openai.azure.com/`)) {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockAzureResponse) }),
+          json: () => Promise.resolve(mockAzureResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns 401 when Authorization and api-key headers are missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-azure-resource': 'my-resource',
+        'x-azure-deployment': 'my-deployment'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(401)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing Authorization or api-key header')
+  })
+
+  it('accepts api-key header as alternative to Authorization', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'api-key': 'test-key',
+        'x-azure-resource': 'my-resource',
+        'x-azure-deployment': 'my-deployment'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(200)
+  })
+
+  it('returns 400 when x-azure-resource header is missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'x-azure-deployment': 'my-deployment'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing x-azure-resource or x-azure-deployment header')
+  })
+
+  it('returns 400 when x-azure-deployment header is missing', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'x-azure-resource': 'my-resource'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing x-azure-resource or x-azure-deployment header')
+  })
+
+  it('returns 400 for invalid resource name (SSRF prevention)', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'x-azure-resource': 'evil.com',
+        'x-azure-deployment': 'my-deployment'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid resource or deployment name')
+  })
+
+  it('returns 400 for invalid deployment name (SSRF prevention)', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'x-azure-resource': 'my-resource',
+        'x-azure-deployment': 'evil;rm -rf /'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid resource or deployment name')
+  })
+
+  it('returns 400 for invalid JSON body', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'x-azure-resource': 'my-resource',
+        'x-azure-deployment': 'my-deployment'
+      },
+      body: '{not json'
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid JSON body')
+  })
+
+  it('forwards request to Azure OpenAI and returns response with trace on success', async () => {
+    const res = await makeAzureProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockAzureResponse)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gpt-4o')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('azure-openai')
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(16)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(8)
+    expect(typeof proxyTrace?.spans[0]?.usage?.totalCost).toBe('number')
+    // Azure OpenAI gpt-4o: $2.50/1M input, $10.00/1M output
+    // 16 * 250/1M = 0.004 cents, 8 * 1000/1M = 0.008 cents
+    // Rounds to 0 cents for small token counts - use >= 0
+    expect(proxyTrace?.spans[0]?.usage?.totalCost).toBeGreaterThanOrEqual(0)
+
+    // Security: API key must not be in trace
+    expect(proxyTrace?.spans[0]?.attributes?.['authorization']).toBeUndefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['api-key']).toBeUndefined()
+  })
+
+  it('creates error trace when upstream fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${AZURE_URL_BASE}my-resource.openai.azure.com/`)) {
+        return {
+          ok: false,
+          status: 429,
+          clone: () => ({ json: () => Promise.resolve(mockErrorResponse) }),
+          json: () => Promise.resolve(mockErrorResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeAzureProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(429)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('azure-openai')
+    expect(errorTrace?.spans[0]?.attributes?.['http.status']).toBe(429)
+  })
+
+  it('creates error trace when network request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${AZURE_URL_BASE}my-resource.openai.azure.com/`)) {
+        throw new Error('ENOTFOUND')
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeAzureProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(502)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
+  })
+
+  it('uses default model when not specified', async () => {
+    const res = await makeAzureProxyRequest({ messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gpt-4o')
+  })
+
+  it('uses custom api-version when provided', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr.startsWith(`${AZURE_URL_BASE}my-resource.openai.azure.com/`) && urlStr.includes('api-version=2024-06-01')) {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockAzureResponse) }),
+          json: () => Promise.resolve(mockAzureResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await fetch(`${baseUrl}/v1/proxy/azure/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'x-azure-resource': 'my-resource',
+        'x-azure-deployment': 'my-deployment',
+        'x-azure-api-version': '2024-06-01'
+      },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    expect(res.status).toBe(200)
+  })
+})
+
 describe('cost aggregation API', () => {
   function seedTraceWithUsage(
     name: string,
