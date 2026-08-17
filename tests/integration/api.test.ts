@@ -190,35 +190,226 @@ describe('trace API list pagination and filtering', () => {
     expect(body.pagination.total).toBe(2)
   })
 
-  it('clamps the limit to the documented maximum', async () => {
+  it('returns 400 when limit exceeds maximum', async () => {
     for (let i = 0; i < 120; i += 1) {
       await seedTrace(`2026-08-16T14:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`, `bulk-${i}`)
     }
 
     const res = await fetch(`${baseUrl}/api/traces?limit=9999`)
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as { data: unknown[]; pagination: { limit: number } }
-    expect(body.data).toHaveLength(100)
-    expect(body.pagination.limit).toBe(100)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('100')
   })
 
-  it('degrades invalid pagination parameters to documented defaults', async () => {
+  it('returns 400 for invalid pagination parameters', async () => {
     const res = await fetch(`${baseUrl}/api/traces?limit=abc&offset=-3&status=bogus`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBeDefined()
+  })
+
+  it('returns 400 when limit is zero', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?limit=0`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('positive')
+  })
+
+  it('returns 400 when limit is 101 (exceeds max)', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?limit=101`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('100')
+  })
+
+  it('returns 400 when limit is 1000 (exceeds max)', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?limit=1000`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('100')
+  })
+
+  it('returns 400 when offset is negative', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?offset=-1`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('non-negative')
+  })
+
+  it('returns 400 when offset is negative (larger magnitude)', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?offset=-100`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('non-negative')
+  })
+
+  it('returns 200 with empty array when offset exceeds total count', async () => {
+    const allRes = await fetch(`${baseUrl}/api/traces`)
+    const allBody = (await allRes.json()) as { pagination: { total: number } }
+    const totalBefore = allBody.pagination.total
+    
+    await seedTrace('2026-08-16T15:00:00.000Z', 'single-trace-offset-test')
+    
+    const res = await fetch(`${baseUrl}/api/traces?offset=999999`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { data: unknown[]; pagination: { limit: number } }
-    expect(Array.isArray(body.data)).toBe(true)
-    expect(body.data.length).toBeLessThanOrEqual(100)
-    expect(body.pagination.limit).toBe(20) // default limit
+    const body = (await res.json()) as { data: unknown[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(0)
+    expect(body.pagination.total).toBe(totalBefore + 1)
+  })
+
+  it('validates limit boundary enforcement (1, 100, 101, 1000)', async () => {
+    await seedTrace('2026-08-16T15:00:00.000Z', 'trace-limit-boundary-test')
+
+    // limit=1 should work
+    const res1 = await fetch(`${baseUrl}/api/traces?limit=1`)
+    expect(res1.status).toBe(200)
+    const body1 = (await res1.json()) as { data: unknown[]; pagination: { limit: number } }
+    expect(body1.pagination.limit).toBe(1)
+
+    // limit=100 should work
+    const res100 = await fetch(`${baseUrl}/api/traces?limit=100`)
+    expect(res100.status).toBe(200)
+    const body100 = (await res100.json()) as { data: unknown[]; pagination: { limit: number } }
+    expect(body100.pagination.limit).toBe(100)
+
+    // limit=101 should fail
+    const res101 = await fetch(`${baseUrl}/api/traces?limit=101`)
+    expect(res101.status).toBe(400)
+
+    // limit=1000 should fail
+    const res1000 = await fetch(`${baseUrl}/api/traces?limit=1000`)
+    expect(res1000.status).toBe(400)
+  })
+
+  it('validates offset boundary (-1, 0, 1, beyond total)', async () => {
+    await seedTrace('2026-08-16T15:00:00.000Z', 'trace-offset-boundary-test')
+
+    // offset=-1 should fail
+    const resNeg1 = await fetch(`${baseUrl}/api/traces?offset=-1`)
+    expect(resNeg1.status).toBe(400)
+
+    // offset=0 should work
+    const res0 = await fetch(`${baseUrl}/api/traces?offset=0`)
+    expect(res0.status).toBe(200)
+
+    // offset=1 should work (returns at least the other traces, not just our new one)
+    const res1 = await fetch(`${baseUrl}/api/traces?offset=1`)
+    expect(res1.status).toBe(200)
+
+    // offset=999999 should work (returns empty)
+    const resBig = await fetch(`${baseUrl}/api/traces?offset=999999`)
+    expect(resBig.status).toBe(200)
+    const bodyBig = (await resBig.json()) as { data: unknown[]; pagination: { total: number } }
+    expect(bodyBig.data).toHaveLength(0)
+  })
+
+  it('pagination works with all filter combinations in isolation', async () => {
+    const now = new Date()
+    const t1 = new Date(now.getTime() + 1000).toISOString()
+    const t2 = new Date(now.getTime() + 2000).toISOString()
+    const t3 = new Date(now.getTime() + 3000).toISOString()
+    await seedTrace(t1, 'filter-isolation-service-a', 'ok')
+    await seedTrace(t2, 'filter-isolation-service-b', 'error')
+    await seedTrace(t3, 'filter-isolation-service-c', 'ok')
+
+    // status=ok
+    let res = await fetch(`${baseUrl}/api/traces?status=ok&limit=10`)
+    expect(res.status).toBe(200)
+    let body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.pagination.total).toBeGreaterThanOrEqual(2)
+    expect(body.data.some((t) => t.name === 'filter-isolation-service-a')).toBe(true)
+    expect(body.data.some((t) => t.name === 'filter-isolation-service-c')).toBe(true)
+
+    // status=error
+    res = await fetch(`${baseUrl}/api/traces?status=error&limit=10`)
+    expect(res.status).toBe(200)
+    body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.pagination.total).toBeGreaterThanOrEqual(1)
+    expect(body.data.some((t) => t.name === 'filter-isolation-service-b')).toBe(true)
+
+    // serviceName
+    res = await fetch(`${baseUrl}/api/traces?serviceName=filter-isolation-service-a&limit=10`)
+    expect(res.status).toBe(200)
+    body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.pagination.total).toBe(1)
+    expect(body.data[0]?.name).toBe('filter-isolation-service-a')
+
+    // sort
+    res = await fetch(`${baseUrl}/api/traces?sort=startTime:asc&limit=10`)
+    expect(res.status).toBe(200)
+    body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.pagination.total).toBeGreaterThanOrEqual(3)
+  })
+
+  it('pagination works with all filters combined', async () => {
+    await seedTrace('2026-08-16T15:00:00.000Z', 'service-x', 'ok')
+    await seedTrace('2026-08-16T15:01:00.000Z', 'service-y', 'error')
+    await seedTrace('2026-08-16T15:02:00.000Z', 'service-z', 'ok')
+
+    const res = await fetch(`${baseUrl}/api/traces?status=ok&serviceName=service-x&limit=10&sort=startTime:desc`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.pagination.total).toBe(1)
+    expect(body.data[0]?.name).toBe('service-x')
+  })
+
+  it('page boundary consistency - no duplicate/missing items across pages', async () => {
+    // Use a unique serviceName (trace name) to isolate these 25 traces from existing DB data
+    const testService = 'page-boundary-consistency-test'
+    for (let i = 0; i < 25; i += 1) {
+      await fetch(`${baseUrl}/api/traces`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: testService,
+          startTime: `2026-08-16T16:${String(i).padStart(2, '0')}:00.000Z`,
+          endTime: new Date(Date.parse(`2026-08-16T16:${String(i).padStart(2, '0')}:00.000Z`) + 1000).toISOString(),
+          spans: [
+            {
+              id: `span-page-trace-${i}`,
+              name: `page-trace-${i}`,
+              startTime: `2026-08-16T16:${String(i).padStart(2, '0')}:00.000Z`,
+              endTime: new Date(Date.parse(`2026-08-16T16:${String(i).padStart(2, '0')}:00.000Z`) + 500).toISOString(),
+              status: 'ok'
+            }
+          ]
+        })
+      })
+    }
+
+    const page1Res = await fetch(`${baseUrl}/api/traces?limit=10&offset=0&serviceName=${testService}`)
+    expect(page1Res.status).toBe(200)
+    const page1 = (await page1Res.json()) as { data: { id: string; name: string; spans: { name: string }[] }[]; pagination: { total: number } }
+    expect(page1.data).toHaveLength(10)
+
+    const page2Res = await fetch(`${baseUrl}/api/traces?limit=10&offset=10&serviceName=${testService}`)
+    expect(page2Res.status).toBe(200)
+    const page2 = (await page2Res.json()) as { data: { id: string; name: string; spans: { name: string }[] }[]; pagination: { total: number } }
+    expect(page2.data).toHaveLength(10)
+
+    const page3Res = await fetch(`${baseUrl}/api/traces?limit=10&offset=20&serviceName=${testService}`)
+    expect(page3Res.status).toBe(200)
+    const page3 = (await page3Res.json()) as { data: { id: string; name: string; spans: { name: string }[] }[]; pagination: { total: number } }
+    expect(page3.data).toHaveLength(5)
+
+    // Verify no duplicates across pages
+    const allIds = [...page1.data, ...page2.data, ...page3.data].map((t) => t.id)
+    const uniqueIds = new Set(allIds)
+    expect(uniqueIds.size).toBe(25)
+
+    // Verify page 1 has newest (span name page-trace-24), page 3 has oldest (span name page-trace-0)
+    expect(page1.data[0]?.spans[0]?.name).toBe('page-trace-24')
+    expect(page3.data[page3.data.length - 1]?.spans[0]?.name).toBe('page-trace-0')
   })
 })
 
 describe('trace API usage fields', () => {
-  async function seedTraceWithUsage(name: string, usage?: { promptTokens: number; completionTokens: number; totalCost?: number }) {
+  async function seedTraceWithUsage(name: string, usage?: { promptTokens: number; completionTokens: number; totalCost?: number }, serviceName = 'usage-test') {
     const res = await fetch(`${baseUrl}/api/traces`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        name,
+        name: serviceName,
         startTime: '2026-08-16T15:00:00.000Z',
         endTime: '2026-08-16T15:00:01.000Z',
         spans: [
@@ -262,7 +453,7 @@ describe('trace API usage fields', () => {
   })
 
   it('round-trips usage fields via GET /api/traces/:id', async () => {
-    const id = await seedTraceWithUsage('round-trip', { promptTokens: 200, completionTokens: 100, totalCost: 0.003 })
+    const id = await seedTraceWithUsage('round-trip', { promptTokens: 200, completionTokens: 100, totalCost: 0.003 }, 'usage-round-trip')
     const res = await fetch(`${baseUrl}/api/traces/${id}`)
     expect(res.status).toBe(200)
     const body = (await res.json()) as { spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }
@@ -270,17 +461,17 @@ describe('trace API usage fields', () => {
   })
 
   it('round-trips usage fields via GET /api/traces list', async () => {
-    await seedTraceWithUsage('list-round-trip', { promptTokens: 150, completionTokens: 75, totalCost: 0.00225 })
-    const res = await fetch(`${baseUrl}/api/traces`)
+    await seedTraceWithUsage('list-round-trip', { promptTokens: 150, completionTokens: 75, totalCost: 0.00225 }, 'usage-list-round-trip')
+    const res = await fetch(`${baseUrl}/api/traces?serviceName=usage-list-round-trip`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { data: Array<{ name: string; spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
-    const found = body.data.find((t) => t.name === 'list-round-trip')
+    const body = (await res.json()) as { data: Array<{ spans: Array<{ name: string; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const found = body.data.find((t) => t.spans[0]?.name === 'llm-call')
     expect(found).toBeDefined()
     expect(found?.spans[0]?.usage).toEqual({ promptTokens: 150, completionTokens: 75, totalCost: 0.00225 })
   })
 
   it('round-trips usage without totalCost', async () => {
-    const id = await seedTraceWithUsage('no-cost', { promptTokens: 100, completionTokens: 50 })
+    const id = await seedTraceWithUsage('no-cost', { promptTokens: 100, completionTokens: 50 }, 'usage-no-cost')
     const res = await fetch(`${baseUrl}/api/traces/${id}`)
     expect(res.status).toBe(200)
     const body = (await res.json()) as { spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }
@@ -288,13 +479,15 @@ describe('trace API usage fields', () => {
   })
 
   it('handles mixed traces with and without usage in list', async () => {
-    await seedTraceWithUsage('mixed-no-usage')
-    await seedTraceWithUsage('mixed-with-usage', { promptTokens: 300, completionTokens: 150, totalCost: 0.0045 })
-    const res = await fetch(`${baseUrl}/api/traces`)
+    await seedTraceWithUsage('mixed-no-usage', undefined, 'usage-mixed')
+    await seedTraceWithUsage('mixed-with-usage', { promptTokens: 300, completionTokens: 150, totalCost: 0.0045 }, 'usage-mixed')
+    const res = await fetch(`${baseUrl}/api/traces?serviceName=usage-mixed`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { data: Array<{ name: string; spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
-    const noUsage = body.data.find((t) => t.name === 'mixed-no-usage')
-    const withUsage = body.data.find((t) => t.name === 'mixed-with-usage')
+    const body = (await res.json()) as { data: Array<{ spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const noUsage = body.data.find((t) => t.spans[0]?.usage === undefined)
+    const withUsage = body.data.find((t) => t.spans[0]?.usage !== undefined)
+    expect(noUsage).toBeDefined()
+    expect(withUsage).toBeDefined()
     expect(noUsage?.spans[0]?.usage).toBeUndefined()
     expect(withUsage?.spans[0]?.usage).toEqual({ promptTokens: 300, completionTokens: 150, totalCost: 0.0045 })
   })

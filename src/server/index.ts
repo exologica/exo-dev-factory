@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { traceSchema } from '../domain/trace.js'
 import { z } from 'zod'
 import { TraceStore } from '../domain/store.js'
-import type { Trace } from '../domain/trace.js'
+import type { Trace, TraceStatus } from '../domain/trace.js'
 import { pricingEngine } from '../domain/pricing.js'
 
 // Anthropic API constants
@@ -78,23 +78,76 @@ const listQuerySchema = z.object({
     .catch(undefined)
 })
 
-app.get('/api/traces', (c) => {
-  const query = listQuerySchema.parse(c.req.query())
-  const page = query.page ?? 1
-  const limit = query.limit ?? DEFAULT_TRACE_LIST_LIMIT
-  const offset = query.offset ?? (page - 1) * limit
+function validatePaginationParams(query: Record<string, string | undefined>): { error: string } | null {
+  const rawLimit = query.limit
+  const rawOffset = query.offset
 
-  const listOptions = {
+  if (rawLimit !== undefined) {
+    const limitNum = Number(rawLimit)
+    if (Number.isNaN(limitNum)) {
+      return { error: 'limit must be a number' }
+    }
+    if (!Number.isInteger(limitNum)) {
+      return { error: 'limit must be an integer' }
+    }
+    if (limitNum <= 0) {
+      return { error: 'limit must be a positive integer (minimum 1)' }
+    }
+    if (limitNum > MAX_TRACE_LIST_LIMIT) {
+      return { error: `limit must not exceed ${MAX_TRACE_LIST_LIMIT}` }
+    }
+  }
+
+  if (rawOffset !== undefined) {
+    const offsetNum = Number(rawOffset)
+    if (Number.isNaN(offsetNum)) {
+      return { error: 'offset must be a number' }
+    }
+    if (!Number.isInteger(offsetNum)) {
+      return { error: 'offset must be an integer' }
+    }
+    if (offsetNum < 0) {
+      return { error: 'offset must be a non-negative integer' }
+    }
+  }
+
+  return null
+}
+
+app.get('/api/traces', (c) => {
+  const query = c.req.query()
+  const validationError = validatePaginationParams(query)
+  if (validationError) {
+    return c.json({ error: validationError.error }, 400)
+  }
+
+const parsed = listQuerySchema.parse(query)
+  const page = parsed.page ?? 1
+  const limit = parsed.limit ?? DEFAULT_TRACE_LIST_LIMIT
+  const offset = parsed.offset ?? (page - 1) * limit
+
+  const listOptions: {
+    limit: number
+    offset: number
+    status?: TraceStatus
+    sessionId?: string
+    userId?: string
+    serviceName?: string
+    operationName?: string
+    startTimeGte?: string
+    startTimeLte?: string
+    sort?: string
+  } = {
     limit,
     offset,
-    status: query.status,
-    sessionId: query.sessionId,
-    userId: query.userId,
-    serviceName: query.serviceName,
-    operationName: query.operationName,
-    startTimeGte: query.startTimeGte,
-    startTimeLte: query.startTimeLte,
-    sort: query.sort
+    status: parsed.status,
+    sessionId: parsed.sessionId,
+    userId: parsed.userId,
+    serviceName: parsed.serviceName,
+    operationName: parsed.operationName,
+    startTimeGte: parsed.startTimeGte,
+    startTimeLte: parsed.startTimeLte,
+    sort: parsed.sort
   }
 
   const data = store.list(listOptions)
