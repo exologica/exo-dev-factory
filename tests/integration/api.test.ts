@@ -1780,6 +1780,49 @@ describe('cost aggregation API', () => {
     expect(body.totalCostCents).toBe(0)
   })
 
+  it('aggregates session cost with mixed traces (some with usage, some without)', async () => {
+    await seedTraceWithUsage('mixed-usage-1', { promptTokens: 1_000_000, completionTokens: 500_000 }, 'gpt-4o', 'session-mixed')
+    // Trace without usage
+    await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'session-mixed',
+        startTime: '2026-08-16T10:00:00.000Z',
+        endTime: '2026-08-16T10:00:01.000Z',
+        spans: [
+          {
+            id: 'span-no-usage',
+            name: 'parse',
+            startTime: '2026-08-16T10:00:00.000Z',
+            endTime: '2026-08-16T10:00:00.500Z',
+            status: 'ok'
+          }
+        ],
+        sessionId: 'session-mixed'
+      })
+    })
+    await seedTraceWithUsage('mixed-usage-2', { promptTokens: 500_000, completionTokens: 250_000 }, 'gpt-4o', 'session-mixed')
+
+    const res = await fetch(`${baseUrl}/api/sessions/session-mixed/cost`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      sessionId: string
+      traceCount: number
+      promptTokens: number
+      completionTokens: number
+      totalCostCents: number
+      totalCostDollars: number
+    }
+    expect(body.sessionId).toBe('session-mixed')
+    expect(body.traceCount).toBe(3)
+    expect(body.promptTokens).toBe(1_500_000)
+    expect(body.completionTokens).toBe(750_000)
+    // trace-1: 750 cents, trace-3: 375 cents = 1125 cents (trace-2 has no usage = 0)
+    expect(body.totalCostCents).toBe(1125)
+    expect(body.totalCostDollars).toBe(11.25)
+  })
+
   it('returns 400 for invalid sessionId', async () => {
     const res = await fetch(`${baseUrl}/api/sessions/${'a'.repeat(129)}/cost`)
     expect(res.status).toBe(400)
