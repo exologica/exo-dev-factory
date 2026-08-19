@@ -6,7 +6,7 @@ import { TraceStore } from '../../src/domain/store.js'
 import type { Trace } from '../../src/domain/trace.js'
 import Database from 'better-sqlite3'
 
-function makeTrace(startTime: string, name = 'trace', spanStatus: 'ok' | 'error' = 'ok', usage?: { promptTokens: number; completionTokens: number; totalCost?: number }): Trace {
+function makeTrace(startTime: string, name = 'trace', spanStatus: 'ok' | 'error' = 'ok', usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number }): Trace {
   return {
     name,
     startTime,
@@ -360,6 +360,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       const traceWithUsage = makeTrace('2026-08-15T10:00:00.000Z', 'usage-trace', 'ok', {
         promptTokens: 150,
         completionTokens: 75,
+        totalTokens: 225,
         totalCost: 0.00225
       })
       const id = store.add(traceWithUsage)
@@ -371,6 +372,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       expect(retrieved?.spans[0]?.usage).toEqual({
         promptTokens: 150,
         completionTokens: 75,
+        totalTokens: 225,
         totalCost: 0.00225
       })
       reopened.close()
@@ -380,7 +382,8 @@ describe('TraceStore (SQLite file-backed)', () => {
       const store = new TraceStore({ dbPath })
       const traceWithUsage = makeTrace('2026-08-15T10:00:00.000Z', 'usage-trace-no-cost', 'ok', {
         promptTokens: 150,
-        completionTokens: 75
+        completionTokens: 75,
+        totalTokens: 225
       })
       const id = store.add(traceWithUsage)
       store.close()
@@ -391,6 +394,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       expect(retrieved?.spans[0]?.usage).toEqual({
         promptTokens: 150,
         completionTokens: 75,
+        totalTokens: 225,
         totalCost: undefined
       })
       reopened.close()
@@ -414,6 +418,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       const traceWithUsage = makeTrace('2026-08-15T10:00:00.000Z', 'list-usage-trace', 'ok', {
         promptTokens: 200,
         completionTokens: 100,
+        totalTokens: 300,
         totalCost: 0.003
       })
       store.add(traceWithUsage)
@@ -426,6 +431,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       expect(found?.spans[0]?.usage).toEqual({
         promptTokens: 200,
         completionTokens: 100,
+        totalTokens: 300,
         totalCost: 0.003
       })
       reopened.close()
@@ -437,6 +443,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       store.add(makeTrace('2026-08-15T10:01:00.000Z', 'with-usage', 'ok', {
         promptTokens: 100,
         completionTokens: 50,
+        totalTokens: 150,
         totalCost: 0.0015
       }))
       store.close()
@@ -449,6 +456,7 @@ describe('TraceStore (SQLite file-backed)', () => {
       expect(withUsage?.spans[0]?.usage).toEqual({
         promptTokens: 100,
         completionTokens: 50,
+        totalTokens: 150,
         totalCost: 0.0015
       })
       reopened.close()

@@ -131,7 +131,12 @@ describe('trace API over real HTTP', () => {
 })
 
 describe('trace API list pagination and filtering', () => {
-  function seedTrace(startTime: string, name: string, spanStatus: 'ok' | 'error' = 'ok') {
+  function seedTrace(
+    startTime: string,
+    name: string,
+    spanStatus: 'ok' | 'error' = 'ok',
+    usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number }
+  ) {
     return fetch(`${baseUrl}/api/traces`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -145,7 +150,8 @@ describe('trace API list pagination and filtering', () => {
             name: 'parse',
             startTime,
             endTime: new Date(Date.parse(startTime) + 500).toISOString(),
-            status: spanStatus
+            status: spanStatus,
+            usage: usage ? { ...usage, totalTokens: usage.totalTokens ?? (usage.promptTokens + usage.completionTokens) } : undefined
           }
         ]
       })
@@ -404,7 +410,7 @@ describe('trace API list pagination and filtering', () => {
 })
 
 describe('trace API usage fields', () => {
-  async function seedTraceWithUsage(name: string, usage?: { promptTokens: number; completionTokens: number; totalCost?: number }, serviceName = 'usage-test') {
+  async function seedTraceWithUsage(name: string, usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number }, serviceName = 'usage-test') {
     const res = await fetch(`${baseUrl}/api/traces`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -442,7 +448,7 @@ describe('trace API usage fields', () => {
             startTime: '2026-08-16T16:00:00.000Z',
             endTime: '2026-08-16T16:00:00.500Z',
             status: 'ok',
-            usage: { promptTokens: 100, completionTokens: 50, totalCost: 0.0015 }
+            usage: { promptTokens: 100, completionTokens: 50, totalTokens: 150, totalCost: 0.0015 }
           }
         ]
       })
@@ -453,43 +459,43 @@ describe('trace API usage fields', () => {
   })
 
   it('round-trips usage fields via GET /api/traces/:id', async () => {
-    const id = await seedTraceWithUsage('round-trip', { promptTokens: 200, completionTokens: 100, totalCost: 0.003 }, 'usage-round-trip')
+    const id = await seedTraceWithUsage('round-trip', { promptTokens: 200, completionTokens: 100, totalTokens: 300, totalCost: 0.003 }, 'usage-round-trip')
     const res = await fetch(`${baseUrl}/api/traces/${id}`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }
-    expect(body.spans[0]?.usage).toEqual({ promptTokens: 200, completionTokens: 100, totalCost: 0.003 })
+    const body = (await res.json()) as { spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number } }> }
+    expect(body.spans[0]?.usage).toEqual({ promptTokens: 200, completionTokens: 100, totalTokens: 300, totalCost: 0.003 })
   })
 
   it('round-trips usage fields via GET /api/traces list', async () => {
-    await seedTraceWithUsage('list-round-trip', { promptTokens: 150, completionTokens: 75, totalCost: 0.00225 }, 'usage-list-round-trip')
+    await seedTraceWithUsage('list-round-trip', { promptTokens: 150, completionTokens: 75, totalTokens: 225, totalCost: 0.00225 }, 'usage-list-round-trip')
     const res = await fetch(`${baseUrl}/api/traces?serviceName=usage-list-round-trip`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { data: Array<{ spans: Array<{ name: string; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const body = (await res.json()) as { data: Array<{ spans: Array<{ name: string; usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number } }> }>; pagination: { total: number } }
     const found = body.data.find((t) => t.spans[0]?.name === 'llm-call')
     expect(found).toBeDefined()
-    expect(found?.spans[0]?.usage).toEqual({ promptTokens: 150, completionTokens: 75, totalCost: 0.00225 })
+    expect(found?.spans[0]?.usage).toEqual({ promptTokens: 150, completionTokens: 75, totalTokens: 225, totalCost: 0.00225 })
   })
 
   it('round-trips usage without totalCost', async () => {
-    const id = await seedTraceWithUsage('no-cost', { promptTokens: 100, completionTokens: 50 }, 'usage-no-cost')
+    const id = await seedTraceWithUsage('no-cost', { promptTokens: 100, completionTokens: 50, totalTokens: 150 }, 'usage-no-cost')
     const res = await fetch(`${baseUrl}/api/traces/${id}`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }
-    expect(body.spans[0]?.usage).toEqual({ promptTokens: 100, completionTokens: 50, totalCost: undefined })
+    const body = (await res.json()) as { spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number } }> }
+    expect(body.spans[0]?.usage).toEqual({ promptTokens: 100, completionTokens: 50, totalTokens: 150, totalCost: undefined })
   })
 
   it('handles mixed traces with and without usage in list', async () => {
     await seedTraceWithUsage('mixed-no-usage', undefined, 'usage-mixed')
-    await seedTraceWithUsage('mixed-with-usage', { promptTokens: 300, completionTokens: 150, totalCost: 0.0045 }, 'usage-mixed')
+    await seedTraceWithUsage('mixed-with-usage', { promptTokens: 300, completionTokens: 150, totalTokens: 450, totalCost: 0.0045 }, 'usage-mixed')
     const res = await fetch(`${baseUrl}/api/traces?serviceName=usage-mixed`)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { data: Array<{ spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const body = (await res.json()) as { data: Array<{ spans: Array<{ usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number } }> }>; pagination: { total: number } }
     const noUsage = body.data.find((t) => t.spans[0]?.usage === undefined)
     const withUsage = body.data.find((t) => t.spans[0]?.usage !== undefined)
     expect(noUsage).toBeDefined()
     expect(withUsage).toBeDefined()
     expect(noUsage?.spans[0]?.usage).toBeUndefined()
-    expect(withUsage?.spans[0]?.usage).toEqual({ promptTokens: 300, completionTokens: 150, totalCost: 0.0045 })
+    expect(withUsage?.spans[0]?.usage).toEqual({ promptTokens: 300, completionTokens: 150, totalTokens: 450, totalCost: 0.0045 })
   })
 
   it('rejects invalid usage fields (negative promptTokens)', async () => {
@@ -1821,7 +1827,7 @@ describe('Azure OpenAI chat completions proxy', () => {
 describe('cost aggregation API', () => {
   function seedTraceWithUsage(
     name: string,
-    usage: { promptTokens: number; completionTokens: number },
+    usage: { promptTokens: number; completionTokens: number; totalTokens?: number },
     model = 'gpt-4o',
     sessionId?: string
   ): Promise<string> {
@@ -1840,7 +1846,7 @@ describe('cost aggregation API', () => {
             startTime: new Date().toISOString(),
             endTime: new Date(Date.now() + 500).toISOString(),
             status: 'ok',
-            usage,
+            usage: { ...usage, totalTokens: (usage.totalTokens ?? (usage.promptTokens + usage.completionTokens)) },
             attributes: { 'llm.model': model }
           }
         ]
@@ -2416,8 +2422,9 @@ describe('trace API expression filter', () => {
     startTime: string,
     name: string,
     spanStatus: 'ok' | 'error' = 'ok',
-    options?: { sessionId?: string; userId?: string; attributes?: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number } }
+    options?: { sessionId?: string; userId?: string; attributes?: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number } }
   ) {
+    const usage = options?.usage
     return fetch(`${baseUrl}/api/traces`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -2435,7 +2442,7 @@ describe('trace API expression filter', () => {
             endTime: new Date(Date.parse(startTime) + 500).toISOString(),
             status: spanStatus,
             attributes: options?.attributes,
-            usage: options?.usage
+            usage: usage ? { ...usage, totalTokens: usage.totalTokens ?? (usage.promptTokens + usage.completionTokens) } : undefined
           }
         ]
       })
@@ -2680,8 +2687,8 @@ describe('trace API expression filter', () => {
 
   it('filters by usage.promptTokens', async () => {
     const prefix = 'filter-usage-'
-    await seedTrace(nextTime(), prefix + 'trace-a', 'ok', { usage: { promptTokens: 100, completionTokens: 10 } })
-    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { usage: { promptTokens: 50, completionTokens: 5 } })
+    await seedTrace(nextTime(), prefix + 'trace-a', 'ok', { usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 } })
+    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { usage: { promptTokens: 50, completionTokens: 5, totalTokens: 55 } })
 
     const res = await fetch(`${baseUrl}/api/traces?filter=usage.promptTokens>75 AND name:${prefix}`)
     expect(res.status).toBe(200)
