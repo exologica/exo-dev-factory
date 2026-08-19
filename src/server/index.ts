@@ -4,6 +4,7 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { traceSchema } from '../domain/trace.js'
+import { parseOtlpTracesRequest, type OtlpTracesRequest } from '../domain/otlp.js'
 import { z } from 'zod'
 import { TraceStore } from '../domain/store.js'
 import type { Trace, TraceStatus } from '../domain/trace.js'
@@ -186,6 +187,34 @@ app.post('/api/traces', async (c) => {
   }
   const id = store.add(parsed.data)
   return c.json({ id }, 201)
+})
+
+// OTLP/HTTP JSON ingestion endpoint
+const MAX_OTLP_PAYLOAD_SIZE = 10 * 1024 * 1024
+
+app.post('/v1/traces', async (c) => {
+  const contentLength = c.req.header('content-length')
+  if (contentLength && parseInt(contentLength, 10) > MAX_OTLP_PAYLOAD_SIZE) {
+    return c.json({ error: 'payload too large', maxSize: MAX_OTLP_PAYLOAD_SIZE }, 413)
+  }
+
+  const body = await c.req.json().catch(() => null)
+  if (body === null) {
+    return c.json({ error: 'invalid JSON body' }, 400)
+  }
+
+  const result = parseOtlpTracesRequest(body)
+  if (!result.success) {
+    return c.json({ error: 'invalid OTLP payload', details: result.error.issues }, 400)
+  }
+
+  const traceIds: string[] = []
+  for (const trace of result.traces) {
+    const id = store.add(trace)
+    traceIds.push(id)
+  }
+
+  return c.json({ traceIds, count: traceIds.length }, 202)
 })
 
 const MAX_TRACE_LIST_LIMIT = 100
