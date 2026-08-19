@@ -12,6 +12,12 @@ import {
 } from '../domain/trace'
 
 const fmtMs = (ms: number) => `${ms}ms`
+
+/** Format token counts with comma separators (e.g., 1,234,567). */
+const fmtTokens = (n: number) => n.toLocaleString()
+
+/** Format cost as USD with 4 decimal places (e.g., $0.0045). */
+const fmtCost = (n: number) => `$${n.toFixed(4)}`
 const PAGE_SIZES = [10, 20, 50, 100] as const
 const DEFAULT_PAGE_SIZE = 10
 const DEBOUNCE_MS = 300
@@ -870,6 +876,31 @@ export default function App() {
                   </>
                 )}
               </p>
+              {traceHasUsage(selected) && (
+                <section className="usage-summary" aria-label="Token usage and cost summary">
+                  <h3>Usage Summary</h3>
+                  <dl className="usage-grid">
+                    <div className="usage-item">
+                      <dt>Prompt tokens</dt>
+                      <dd>{fmtTokens(traceTotalPromptTokens(selected))}</dd>
+                    </div>
+                    <div className="usage-item">
+                      <dt>Completion tokens</dt>
+                      <dd>{fmtTokens(traceTotalCompletionTokens(selected))}</dd>
+                    </div>
+                    <div className="usage-item">
+                      <dt>Total tokens</dt>
+                      <dd>{fmtTokens(traceTotalPromptTokens(selected) + traceTotalCompletionTokens(selected))}</dd>
+                    </div>
+                    {traceTotalCost(selected) > 0 && (
+                      <div className="usage-item">
+                        <dt>Total cost</dt>
+                        <dd>{fmtCost(traceTotalCost(selected))}</dd>
+                      </div>
+                    )}
+                  </dl>
+                </section>
+              )}
               <ul className="spans">
                 {selected.spans.map((s) => (
                   <SpanRow key={s.id} span={s} />
@@ -936,6 +967,12 @@ export default function App() {
         .session-badge-link:hover { color: #c8e1ff; text-decoration-style: solid; }
         .session-badge-link:focus { outline: none; color: #c8e1ff; }
         .user-badge { color: #ffa657; font-size: 13px; }
+        .usage-summary { background: #161a20; border: 1px solid #232830; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .usage-summary h3 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #8b949e; }
+        .usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+        .usage-item { display: flex; flex-direction: column; gap: 4px; }
+        .usage-item dt { font-size: 12px; color: #8b949e; }
+        .usage-item dd { margin: 0; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
         .spans { list-style: none; padding: 0; margin: 0; }
         .span { display: flex; justify-content: space-between; gap: 12px; background: #161a20; border: 1px solid #232830; border-left: 3px solid #2f9e44; border-radius: 6px; padding: 8px 12px; margin-bottom: 6px; }
         .span.error { border-left-color: #e03131; }
