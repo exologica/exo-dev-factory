@@ -397,6 +397,61 @@ app.get('/api/cost/summary', (c) => {
   return c.json(cost)
 })
 
+// Usage aggregation endpoints
+
+const usageSummaryQuerySchema = z.object({
+  since: z.string().datetime({ offset: true }).optional(),
+  until: z.string().datetime({ offset: true }).optional(),
+  sessionId: z.string().max(128).optional(),
+  userId: z.string().max(128).optional()
+})
+
+function validateDateParam(value: string | undefined, paramName: string): void {
+  if (value !== undefined) {
+    const date = new Date(value)
+    if (isNaN(date.getTime())) {
+      throw new Error(`invalid ${paramName} parameter: must be valid ISO 8601 date`)
+    }
+  }
+}
+
+app.get('/api/traces/:id/usage', (c) => {
+  const usage = store.getTraceUsage(c.req.param('id'))
+  if (!usage) {
+    return c.json({ error: 'trace not found' }, 404)
+  }
+  return c.json(usage)
+})
+
+app.get('/api/usage/summary', (c) => {
+  const rawQuery = c.req.query()
+  try {
+    validateDateParam(rawQuery.since, 'since')
+    validateDateParam(rawQuery.until, 'until')
+  } catch (err) {
+    if (err instanceof Error) {
+      return c.json({ error: err.message }, 400)
+    }
+    return c.json({ error: 'invalid query parameters' }, 400)
+  }
+
+  const query = usageSummaryQuerySchema.parse(rawQuery)
+  try {
+    const usage = store.getUsageSummary({
+      since: query.since,
+      until: query.until,
+      sessionId: query.sessionId,
+      userId: query.userId
+    })
+    return c.json(usage)
+  } catch (err) {
+    if (err instanceof Error) {
+      return c.json({ error: err.message }, 400)
+    }
+    return c.json({ error: 'invalid query parameters' }, 400)
+  }
+})
+
 app.post('/v1/proxy/chat/completions', async (c) => {
   const authHeader = c.req.header('authorization')
   if (!authHeader || !authHeader.startsWith('Bearer ')) {

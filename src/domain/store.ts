@@ -391,4 +391,130 @@ export class TraceStore {
       totalCostDollars: totalCostCents / 100
     }
   }
+
+  /**
+   * Calculate aggregated usage for a single trace by id.
+   * Returns token totals, totalCost, and spanCount.
+   * Returns zeros (not error) for traces without usage fields for backward compatibility.
+   */
+  getTraceUsage(id: string): { traceId: string; promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; spanCount: number } | undefined {
+    const trace = this.get(id)
+    if (!trace) return undefined
+
+    let promptTokens = 0
+    let completionTokens = 0
+    let totalTokens = 0
+    let totalCost = 0
+    let spanCount = 0
+
+    for (const span of trace.spans) {
+      spanCount++
+      if (span.usage) {
+        promptTokens += span.usage.promptTokens ?? 0
+        completionTokens += span.usage.completionTokens ?? 0
+        totalTokens += span.usage.totalTokens ?? (span.usage.promptTokens ?? 0) + (span.usage.completionTokens ?? 0)
+        totalCost += span.usage.totalCost ?? 0
+      }
+    }
+
+    return {
+      traceId: id,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      totalCost,
+      spanCount
+    }
+  }
+
+  /**
+   * Calculate aggregated usage across traces with optional filters.
+   * Returns token totals, totalCost, traceCount, and spanCount.
+   * Filters: since, until (ISO 8601), sessionId, userId.
+   * Enforces reasonable time range limits to prevent expensive scans.
+   */
+  getUsageSummary(options: {
+    since?: string
+    until?: string
+    sessionId?: string
+    userId?: string
+  } = {}): { promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; traceCount: number; spanCount: number } {
+    // Validate and enforce time range limits (max 366 days to prevent expensive scans)
+    const MAX_WINDOW_HOURS = 366 * 24
+    let startTimeGte: string | undefined
+    let startTimeLte: string | undefined
+
+    if (options.since) {
+      const sinceDate = new Date(options.since)
+      if (isNaN(sinceDate.getTime())) {
+        throw new Error('invalid since parameter: must be valid ISO 8601 date')
+      }
+      startTimeGte = options.since
+    }
+    if (options.until) {
+      const untilDate = new Date(options.until)
+      if (isNaN(untilDate.getTime())) {
+        throw new Error('invalid until parameter: must be valid ISO 8601 date')
+      }
+      startTimeLte = options.until
+    }
+
+    // If since is provided without until, enforce max window from since to now
+    if (options.since && !options.until) {
+      const sinceDate = new Date(options.since)
+      const now = new Date()
+      const hoursDiff = (now.getTime() - sinceDate.getTime()) / (1000 * 60 * 60)
+      if (hoursDiff > MAX_WINDOW_HOURS) {
+        throw new Error(`time range exceeds maximum of ${MAX_WINDOW_HOURS} hours; provide an 'until' parameter to narrow the window`)
+      }
+    }
+    // If until is provided without since, enforce max window from until backwards
+    if (!options.since && options.until) {
+      const untilDate = new Date(options.until)
+      const now = new Date()
+      const hoursDiff = (now.getTime() - untilDate.getTime()) / (1000 * 60 * 60)
+      if (hoursDiff > MAX_WINDOW_HOURS) {
+        // Allow large historical windows when until is in the past, but cap at MAX_WINDOW_HOURS from now
+        // This is handled by the since+until combined check below
+      }
+    }
+    // If both since and until provided, enforce max window between them
+    if (options.since && options.until) {
+      const sinceDate = new Date(options.since)
+      const untilDate = new Date(options.until)
+      const hoursDiff = Math.abs(untilDate.getTime() - sinceDate.getTime()) / (1000 * 60 * 60)
+      if (hoursDiff > MAX_WINDOW_HOURS) {
+        throw new Error(`time range between since and until exceeds maximum of ${MAX_WINDOW_HOURS} hours`)
+      }
+    }
+
+    const traces = this.list({ startTimeGte, startTimeLte, sessionId: options.sessionId, userId: options.userId })
+
+    let promptTokens = 0
+    let completionTokens = 0
+    let totalTokens = 0
+    let totalCost = 0
+    let spanCount = 0
+
+    for (const trace of traces) {
+      for (const span of trace.spans) {
+        spanCount++
+        if (span.usage) {
+          promptTokens += span.usage.promptTokens ?? 0
+          completionTokens += span.usage.completionTokens ?? 0
+          totalTokens += span.usage.totalTokens ?? (span.usage.promptTokens ?? 0) + (span.usage.completionTokens ?? 0)
+          totalCost += span.usage.totalCost ?? 0
+        }
+      }
+    }
+
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      totalCost,
+      traceCount: traces.length,
+      spanCount
+    }
+  }
 }

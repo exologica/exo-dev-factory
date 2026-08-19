@@ -545,6 +545,208 @@ describe('trace API usage fields', () => {
   })
 })
 
+describe('trace API usage aggregation endpoints', () => {
+  async function seedTraceWithUsage(name: string, usage?: { promptTokens: number; completionTokens: number; totalTokens?: number; totalCost?: number }, serviceName = 'usage-agg-test', sessionId?: string, userId?: string) {
+    const res = await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: serviceName,
+        sessionId,
+        userId,
+        startTime: '2026-08-16T15:00:00.000Z',
+        endTime: '2026-08-16T15:00:01.000Z',
+        spans: [
+          {
+            id: `span-${name}`,
+            name: 'llm-call',
+            startTime: '2026-08-16T15:00:00.000Z',
+            endTime: '2026-08-16T15:00:00.500Z',
+            status: 'ok',
+            usage
+          }
+        ]
+      })
+    })
+    return ((await res.json()) as { id: string }).id
+  }
+
+  it('returns 200 with aggregated usage for a trace with usage fields', async () => {
+    const id = await seedTraceWithUsage('agg-usage', { promptTokens: 200, completionTokens: 100, totalTokens: 300, totalCost: 0.003 })
+    const res = await fetch(`${baseUrl}/api/traces/${id}/usage`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { traceId: string; promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; spanCount: number }
+    expect(body.traceId).toBe(id)
+    expect(body.promptTokens).toBe(200)
+    expect(body.completionTokens).toBe(100)
+    expect(body.totalTokens).toBe(300)
+    expect(body.totalCost).toBe(0.003)
+    expect(body.spanCount).toBe(1)
+  })
+
+  it('returns zeros for trace without usage fields (backward compatibility)', async () => {
+    const id = await seedTraceWithUsage('agg-no-usage', undefined)
+    const res = await fetch(`${baseUrl}/api/traces/${id}/usage`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { traceId: string; promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; spanCount: number }
+    expect(body.traceId).toBe(id)
+    expect(body.promptTokens).toBe(0)
+    expect(body.completionTokens).toBe(0)
+    expect(body.totalTokens).toBe(0)
+    expect(body.totalCost).toBe(0)
+    expect(body.spanCount).toBe(1)
+  })
+
+  it('returns 404 for unknown trace id', async () => {
+    const res = await fetch(`${baseUrl}/api/traces/no-such-id/usage`)
+    expect(res.status).toBe(404)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('trace not found')
+  })
+
+  it('sums usage across multiple spans in a trace', async () => {
+    const res = await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'multi-span-agg',
+        startTime: '2026-08-16T15:00:00.000Z',
+        endTime: '2026-08-16T15:00:10.000Z',
+        spans: [
+          {
+            id: 'span-1',
+            name: 'llm-call-1',
+            startTime: '2026-08-16T15:00:00.000Z',
+            endTime: '2026-08-16T15:00:05.000Z',
+            status: 'ok',
+            usage: { promptTokens: 500, completionTokens: 250, totalTokens: 750, totalCost: 0.0075 }
+          },
+          {
+            id: 'span-2',
+            name: 'llm-call-2',
+            startTime: '2026-08-16T15:00:05.000Z',
+            endTime: '2026-08-16T15:00:10.000Z',
+            status: 'ok',
+            usage: { promptTokens: 300, completionTokens: 150, totalTokens: 450, totalCost: 0.0045 }
+          }
+        ]
+      })
+    })
+    const id = ((await res.json()) as { id: string }).id
+
+    const usageRes = await fetch(`${baseUrl}/api/traces/${id}/usage`)
+    expect(usageRes.status).toBe(200)
+    const body = (await usageRes.json()) as { promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; spanCount: number }
+    expect(body.promptTokens).toBe(800)
+    expect(body.completionTokens).toBe(400)
+    expect(body.totalTokens).toBe(1200)
+    expect(body.totalCost).toBe(0.012)
+    expect(body.spanCount).toBe(2)
+  })
+
+  it('GET /api/usage/summary returns aggregated usage across all traces', async () => {
+    const uniqueService = `usage-summary-all-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    await seedTraceWithUsage('summary-1', { promptTokens: 1000, completionTokens: 500, totalTokens: 1500, totalCost: 0.015 }, uniqueService)
+    await seedTraceWithUsage('summary-2', { promptTokens: 2000, completionTokens: 1000, totalTokens: 3000, totalCost: 0.030 }, uniqueService)
+
+    const res = await fetch(`${baseUrl}/api/usage/summary`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; traceCount: number; spanCount: number }
+    // Other tests may have seeded traces; assert at least our values
+    expect(body.promptTokens).toBeGreaterThanOrEqual(3000)
+    expect(body.completionTokens).toBeGreaterThanOrEqual(1500)
+    expect(body.totalTokens).toBeGreaterThanOrEqual(4500)
+    expect(body.totalCost).toBeGreaterThanOrEqual(0.045)
+    expect(body.traceCount).toBeGreaterThanOrEqual(2)
+    expect(body.spanCount).toBeGreaterThanOrEqual(2)
+  })
+
+  it('GET /api/usage/summary filters by sessionId', async () => {
+    await seedTraceWithUsage('session-1-trace', { promptTokens: 1000, completionTokens: 500, totalCost: 0.015 }, 'usage-agg-test', 'session-a')
+    await seedTraceWithUsage('session-2-trace', { promptTokens: 2000, completionTokens: 1000, totalCost: 0.030 }, 'usage-agg-test', 'session-b')
+
+    const res = await fetch(`${baseUrl}/api/usage/summary?sessionId=session-a`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { promptTokens: number; completionTokens: number; totalCost: number; traceCount: number }
+    expect(body.promptTokens).toBe(1000)
+    expect(body.completionTokens).toBe(500)
+    expect(body.totalCost).toBe(0.015)
+    expect(body.traceCount).toBe(1)
+  })
+
+  it('GET /api/usage/summary filters by userId', async () => {
+    await seedTraceWithUsage('user-1-trace', { promptTokens: 1000, completionTokens: 500, totalCost: 0.015 }, 'usage-agg-test', undefined, 'user-x')
+    await seedTraceWithUsage('user-2-trace', { promptTokens: 2000, completionTokens: 1000, totalCost: 0.030 }, 'usage-agg-test', undefined, 'user-y')
+
+    const res = await fetch(`${baseUrl}/api/usage/summary?userId=user-x`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { promptTokens: number; traceCount: number }
+    expect(body.promptTokens).toBe(1000)
+    expect(body.traceCount).toBe(1)
+  })
+
+  it('GET /api/usage/summary filters by since (ISO 8601)', async () => {
+    const now = new Date()
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
+    const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString()
+
+    // Use unique service names to isolate these traces
+    const res1 = await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'since-test-recent',
+        startTime: oneHourAgo,
+        endTime: new Date(Date.parse(oneHourAgo) + 1000).toISOString(),
+        spans: [{ id: 's1', name: 'llm-call', startTime: oneHourAgo, endTime: new Date(Date.parse(oneHourAgo) + 500).toISOString(), status: 'ok', usage: { promptTokens: 1000, completionTokens: 500 } }]
+      })
+    })
+    const res2 = await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'since-test-old',
+        startTime: threeHoursAgo,
+        endTime: new Date(Date.parse(threeHoursAgo) + 1000).toISOString(),
+        spans: [{ id: 's2', name: 'llm-call', startTime: threeHoursAgo, endTime: new Date(Date.parse(threeHoursAgo) + 500).toISOString(), status: 'ok', usage: { promptTokens: 2000, completionTokens: 1000 } }]
+      })
+    })
+
+    const sinceRes = await fetch(`${baseUrl}/api/usage/summary?since=${encodeURIComponent(oneHourAgo)}`)
+    expect(sinceRes.status).toBe(200)
+    const body = (await sinceRes.json()) as { promptTokens: number; traceCount: number }
+    // Should only include the recent trace
+    expect(body.traceCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it('GET /api/usage/summary returns 400 for invalid since parameter', async () => {
+    const res = await fetch(`${baseUrl}/api/usage/summary?since=not-a-date`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('invalid since parameter')
+  })
+
+  it('GET /api/usage/summary returns 400 for invalid until parameter', async () => {
+    const res = await fetch(`${baseUrl}/api/usage/summary?until=not-a-date`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toContain('invalid until parameter')
+  })
+
+  it('GET /api/usage/summary returns zeros for empty result', async () => {
+    const res = await fetch(`${baseUrl}/api/usage/summary?sessionId=empty-session`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { promptTokens: number; completionTokens: number; totalTokens: number; totalCost: number; traceCount: number; spanCount: number }
+    expect(body.promptTokens).toBe(0)
+    expect(body.completionTokens).toBe(0)
+    expect(body.totalTokens).toBe(0)
+    expect(body.totalCost).toBe(0)
+    expect(body.traceCount).toBe(0)
+    expect(body.spanCount).toBe(0)
+  })
+})
+
 describe('trace API deletion', () => {
   async function seedTrace(name: string) {
     const res = await fetch(`${baseUrl}/api/traces`, {
