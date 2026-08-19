@@ -4,6 +4,7 @@ export const usageSchema = z
   .object({
     promptTokens: z.number().int().nonnegative().max(10_000_000),
     completionTokens: z.number().int().nonnegative().max(10_000_000),
+    totalTokens: z.number().int().nonnegative().max(20_000_000).optional(),
     totalCost: z.number().nonnegative().optional()
   })
   .optional()

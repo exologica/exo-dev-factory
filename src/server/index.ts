@@ -454,6 +454,7 @@ app.post('/v1/proxy/chat/completions', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalTokens: promptTokens + completionTokens,
           totalCost
         }
       }
@@ -555,6 +556,7 @@ app.post('/v1/proxy/anthropic/messages', async (c) => {
         usage: {
           promptTokens: inputTokens,
           completionTokens: outputTokens,
+          totalTokens: inputTokens + outputTokens,
           totalCost
         }
       }
@@ -668,6 +670,7 @@ app.post('/v1/proxy/gemini/generateContent', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalTokens: promptTokens + completionTokens,
           totalCost
         }
       }
@@ -775,6 +778,7 @@ app.post('/v1/proxy/cohere/v1/chat', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalTokens: promptTokens + completionTokens,
           totalCost
         }
       }
@@ -880,6 +884,7 @@ app.post('/v1/proxy/mistral/v1/chat/completions', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalTokens: promptTokens + completionTokens,
           totalCost
         }
       }
@@ -999,6 +1004,7 @@ app.post('/v1/proxy/responses', async (c) => {
         usage: {
           promptTokens: inputTokens,
           completionTokens: outputTokens,
+          totalTokens: inputTokens + outputTokens,
           totalCost
         }
       }
@@ -1129,6 +1135,7 @@ app.post('/v1/proxy/azure/chat/completions', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalTokens: promptTokens + completionTokens,
           totalCost
         }
       }
@@ -1305,6 +1312,7 @@ app.post('/v1/proxy/passthrough/**', async (c) => {
         usage: {
           promptTokens,
           completionTokens,
+          totalTokens: promptTokens + completionTokens,
           totalCost
         }
       }
