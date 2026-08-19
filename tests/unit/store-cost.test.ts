@@ -11,13 +11,15 @@ function makeTrace(
   spanStatus: 'ok' | 'error' = 'ok',
   usage?: { promptTokens: number; completionTokens: number; totalCost?: number },
   model?: string,
-  sessionId?: string
+  sessionId?: string,
+  userId?: string
 ): Trace {
   return {
     name,
     startTime,
     endTime: new Date(Date.parse(startTime) + 1000).toISOString(),
     sessionId,
+    userId,
     spans: [
       {
         id: `span-${startTime}`,
@@ -212,6 +214,223 @@ describe('TraceStore cost aggregation', () => {
       expect(cost.traceCount).toBe(2)
       // gpt-4o: 1250 cents, claude: 1800 cents = 3050 cents
       expect(cost.totalCostCents).toBe(3050)
+    })
+  })
+
+  describe('getTraceUsage', () => {
+    it('returns usage breakdown for trace with usage', () => {
+      const trace = makeTrace(
+        '2026-08-15T10:00:00.000Z',
+        'usage-trace',
+        'ok',
+        { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 },
+        'gpt-4o'
+      )
+      const id = store.add(trace)
+
+      const usage = store.getTraceUsage(id)
+      expect(usage).toBeDefined()
+      expect(usage?.traceId).toBe(id)
+      expect(usage?.promptTokens).toBe(1_000_000)
+      expect(usage?.completionTokens).toBe(500_000)
+      expect(usage?.totalTokens).toBe(1_500_000)
+      expect(usage?.totalCost).toBe(7.50)
+      expect(usage?.spanCount).toBe(1)
+    })
+
+    it('returns undefined for non-existent trace', () => {
+      const usage = store.getTraceUsage('non-existent')
+      expect(usage).toBeUndefined()
+    })
+
+    it('returns zeros for trace without usage (backward compatibility)', () => {
+      const trace = makeTrace('2026-08-15T10:00:00.000Z', 'no-usage')
+      const id = store.add(trace)
+
+      const usage = store.getTraceUsage(id)
+      expect(usage).toBeDefined()
+      expect(usage?.promptTokens).toBe(0)
+      expect(usage?.completionTokens).toBe(0)
+      expect(usage?.totalTokens).toBe(0)
+      expect(usage?.totalCost).toBe(0)
+      expect(usage?.spanCount).toBe(1)
+    })
+
+    it('sums usage across multiple spans', () => {
+      const trace: Trace = {
+        name: 'multi-span',
+        startTime: '2026-08-15T10:00:00.000Z',
+        endTime: '2026-08-15T10:00:10.000Z',
+        spans: [
+          {
+            id: 'span-1',
+            name: 'llm-call-1',
+            startTime: '2026-08-15T10:00:00.000Z',
+            endTime: '2026-08-15T10:00:05.000Z',
+            status: 'ok',
+            usage: { promptTokens: 500_000, completionTokens: 250_000, totalTokens: 750_000, totalCost: 3.75 }
+          },
+          {
+            id: 'span-2',
+            name: 'llm-call-2',
+            startTime: '2026-08-15T10:00:05.000Z',
+            endTime: '2026-08-15T10:00:10.000Z',
+            status: 'ok',
+            usage: { promptTokens: 500_000, completionTokens: 250_000, totalTokens: 750_000, totalCost: 3.75 }
+          }
+        ]
+      }
+      const id = store.add(trace)
+
+      const usage = store.getTraceUsage(id)
+      expect(usage?.promptTokens).toBe(1_000_000)
+      expect(usage?.completionTokens).toBe(500_000)
+      expect(usage?.totalTokens).toBe(1_500_000)
+      expect(usage?.totalCost).toBe(7.50)
+      expect(usage?.spanCount).toBe(2)
+    })
+
+    it('handles partial usage fields (missing totalTokens, totalCost)', () => {
+      const trace: Trace = {
+        name: 'partial-usage',
+        startTime: '2026-08-15T10:00:00.000Z',
+        endTime: '2026-08-15T10:00:10.000Z',
+        spans: [
+          {
+            id: 'span-1',
+            name: 'llm-call-1',
+            startTime: '2026-08-15T10:00:00.000Z',
+            endTime: '2026-08-15T10:00:05.000Z',
+            status: 'ok',
+            usage: { promptTokens: 100, completionTokens: 50 } // no totalTokens, no totalCost
+          }
+        ]
+      }
+      const id = store.add(trace)
+
+      const usage = store.getTraceUsage(id)
+      expect(usage?.promptTokens).toBe(100)
+      expect(usage?.completionTokens).toBe(50)
+      expect(usage?.totalTokens).toBe(150) // computed from prompt + completion
+      expect(usage?.totalCost).toBe(0)
+      expect(usage?.spanCount).toBe(1)
+    })
+  })
+
+  describe('getUsageSummary', () => {
+    it('aggregates usage across all traces', () => {
+      const now = new Date()
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+      const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
+
+      store.add(makeTrace(oneHourAgo, 'trace-1', 'ok', { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 }, 'gpt-4o'))
+      store.add(makeTrace(twoHoursAgo, 'trace-2', 'ok', { promptTokens: 500_000, completionTokens: 250_000, totalCost: 3.75 }, 'gpt-4o'))
+
+      const usage = store.getUsageSummary()
+      expect(usage.promptTokens).toBe(1_500_000)
+      expect(usage.completionTokens).toBe(750_000)
+      expect(usage.totalTokens).toBe(2_250_000)
+      expect(usage.totalCost).toBe(11.25)
+      expect(usage.traceCount).toBe(2)
+      expect(usage.spanCount).toBe(2)
+    })
+
+    it('filters by sessionId', () => {
+      const now = new Date()
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+
+      store.add(makeTrace(oneHourAgo, 'trace-1', 'ok', { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 }, 'gpt-4o', 'session-1'))
+      store.add(makeTrace(oneHourAgo, 'trace-2', 'ok', { promptTokens: 500_000, completionTokens: 250_000, totalCost: 3.75 }, 'gpt-4o', 'session-2'))
+
+      const usage = store.getUsageSummary({ sessionId: 'session-1' })
+      expect(usage.promptTokens).toBe(1_000_000)
+      expect(usage.completionTokens).toBe(500_000)
+      expect(usage.totalCost).toBe(7.50)
+      expect(usage.traceCount).toBe(1)
+      expect(usage.spanCount).toBe(1)
+    })
+
+    it('filters by userId', () => {
+      const now = new Date()
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+
+      store.add(makeTrace(oneHourAgo, 'trace-1', 'ok', { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 }, 'gpt-4o', undefined, 'user-1'))
+      store.add(makeTrace(oneHourAgo, 'trace-2', 'ok', { promptTokens: 500_000, completionTokens: 250_000, totalCost: 3.75 }, 'gpt-4o', undefined, 'user-2'))
+
+      const usage = store.getUsageSummary({ userId: 'user-1' })
+      expect(usage.promptTokens).toBe(1_000_000)
+      expect(usage.traceCount).toBe(1)
+    })
+
+    it('filters by since (ISO 8601)', () => {
+      const now = new Date()
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+      const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
+      const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString()
+
+      store.add(makeTrace(oneHourAgo, 'recent-1', 'ok', { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 }, 'gpt-4o'))
+      store.add(makeTrace(twoHoursAgo, 'recent-2', 'ok', { promptTokens: 500_000, completionTokens: 250_000, totalCost: 3.75 }, 'gpt-4o'))
+      store.add(makeTrace(threeHoursAgo, 'old', 'ok', { promptTokens: 2_000_000, completionTokens: 1_000_000, totalCost: 15.00 }, 'gpt-4o'))
+
+      const usage = store.getUsageSummary({ since: oneHourAgo })
+      expect(usage.traceCount).toBe(1)
+      expect(usage.promptTokens).toBe(1_000_000)
+    })
+
+    it('filters by until (ISO 8601)', () => {
+      const now = new Date()
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+      const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
+      const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString()
+
+      store.add(makeTrace(oneHourAgo, 'recent-1', 'ok', { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 }, 'gpt-4o'))
+      store.add(makeTrace(twoHoursAgo, 'recent-2', 'ok', { promptTokens: 500_000, completionTokens: 250_000, totalCost: 3.75 }, 'gpt-4o'))
+      store.add(makeTrace(threeHoursAgo, 'old', 'ok', { promptTokens: 2_000_000, completionTokens: 1_000_000, totalCost: 15.00 }, 'gpt-4o'))
+
+      const usage = store.getUsageSummary({ until: twoHoursAgo })
+      expect(usage.traceCount).toBe(2)
+      expect(usage.promptTokens).toBe(2_500_000)
+    })
+
+    it('filters by since and until combined', () => {
+      const now = new Date()
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
+      const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
+      const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString()
+
+      store.add(makeTrace(oneHourAgo, 'recent-1', 'ok', { promptTokens: 1_000_000, completionTokens: 500_000, totalCost: 7.50 }, 'gpt-4o'))
+      store.add(makeTrace(twoHoursAgo, 'recent-2', 'ok', { promptTokens: 500_000, completionTokens: 250_000, totalCost: 3.75 }, 'gpt-4o'))
+      store.add(makeTrace(threeHoursAgo, 'old', 'ok', { promptTokens: 2_000_000, completionTokens: 1_000_000, totalCost: 15.00 }, 'gpt-4o'))
+
+      const usage = store.getUsageSummary({ since: threeHoursAgo, until: oneHourAgo })
+      expect(usage.traceCount).toBe(3)
+      expect(usage.promptTokens).toBe(3_500_000)
+    })
+
+    it('returns zeros for empty result', () => {
+      const usage = store.getUsageSummary({ sessionId: 'empty-session' })
+      expect(usage.promptTokens).toBe(0)
+      expect(usage.completionTokens).toBe(0)
+      expect(usage.totalTokens).toBe(0)
+      expect(usage.totalCost).toBe(0)
+      expect(usage.traceCount).toBe(0)
+      expect(usage.spanCount).toBe(0)
+    })
+
+    it('throws on invalid since parameter', () => {
+      expect(() => store.getUsageSummary({ since: 'not-a-date' })).toThrow('invalid since parameter')
+    })
+
+    it('throws on invalid until parameter', () => {
+      expect(() => store.getUsageSummary({ until: 'not-a-date' })).toThrow('invalid until parameter')
+    })
+
+    it('throws when since-until window exceeds maximum', () => {
+      const now = new Date()
+      const longAgo = new Date(now.getTime() - 400 * 24 * 60 * 60 * 1000).toISOString() // 400 days ago
+      const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()
+
+      expect(() => store.getUsageSummary({ since: longAgo, until: yesterday })).toThrow('exceeds maximum')
     })
   })
 })
