@@ -947,6 +947,211 @@ describe('OpenAI chat completions proxy', () => {
   })
 })
 
+describe('OpenAI chat completions proxy streaming', () => {
+  const mockStreamingChunks = [
+    'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1723833600,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}\n\n',
+    'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1723833600,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}\n\n',
+    'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1723833600,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n',
+    'data: [DONE]\n\n'
+  ]
+
+  const OPENAI_URL = 'https://api.openai.com/v1/chat/completions'
+  const originalFetch = global.fetch
+
+  function makeStreamingProxyRequest(body: unknown, authHeader = 'Bearer test-key') {
+    return fetch(`${baseUrl}/v1/proxy/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: authHeader },
+      body: JSON.stringify(body)
+    })
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === OPENAI_URL) {
+        const encoder = new TextEncoder()
+        const allChunks = mockStreamingChunks.join('')
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(allChunks))
+              controller.close()
+            }
+          })
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('returns 401 when Authorization header is missing for streaming request', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    })
+    expect(res.status).toBe(401)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('missing or invalid Authorization header')
+  })
+
+  it('returns 400 for invalid JSON body in streaming request', async () => {
+    const res = await fetch(`${baseUrl}/v1/proxy/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: '{not json'
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('invalid JSON body')
+  })
+
+  it('forwards streaming response from OpenAI and creates trace on completion', async () => {
+    const res = await makeStreamingProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('text/event-stream')
+
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    let receivedChunks = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      receivedChunks += decoder.decode(value, { stream: true })
+    }
+
+    // Verify all chunks were forwarded
+    expect(receivedChunks).toContain('"content":"Hello"')
+    expect(receivedChunks).toContain('"content":" world"')
+    expect(receivedChunks).toContain('"finish_reason":"stop"')
+    // Note: [DONE] marker is forwarded if present in upstream response
+
+    // Verify trace was created with usage from final chunk
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.attributes?.['streaming'] === true))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['llm.model']).toBe('gpt-4o')
+    expect(proxyTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai')
+    expect(proxyTrace?.spans[0]?.attributes?.['streaming']).toBe(true)
+    expect(proxyTrace?.spans[0]?.usage?.promptTokens).toBe(10)
+    expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(5)
+    expect(typeof proxyTrace?.spans[0]?.usage?.totalCost).toBe('number')
+
+    // Security: Authorization header must not be in trace
+    expect(proxyTrace?.spans[0]?.attributes?.['authorization']).toBeUndefined()
+  })
+
+  it('creates error trace when upstream streaming fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === OPENAI_URL) {
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('data: {"error":{"message":"Rate limit exceeded"}}\n\n'))
+              controller.close()
+            }
+          })
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeStreamingProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(429)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call' && s.status === 'error' && s.attributes?.['streaming'] === true))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['llm.model']).toBe('unknown')
+    expect(errorTrace?.spans[0]?.attributes?.['proxy.upstream']).toBe('openai')
+    expect(errorTrace?.spans[0]?.attributes?.['http.status']).toBe(429)
+    expect(errorTrace?.spans[0]?.attributes?.['streaming']).toBe(true)
+  })
+
+  it('creates error trace when network request fails during streaming', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === OPENAI_URL) {
+        throw new Error('ENOTFOUND')
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeStreamingProxyRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    expect(res.status).toBe(502)
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; status: string; attributes: Record<string, unknown> }> }>; pagination: { total: number } }
+    const errorTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-proxy' && s.status === 'error'))
+    expect(errorTrace).toBeDefined()
+    expect(errorTrace?.spans[0]?.attributes?.['error.message']).toBe('ENOTFOUND')
+  })
+
+  it('non-streaming requests continue to work unchanged', async () => {
+    const mockNonStreamingResponse = {
+      id: 'chatcmpl-test',
+      object: 'chat.completion',
+      created: 1723833600,
+      model: 'gpt-4o',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: 'Hello!' },
+          finish_reason: 'stop'
+        }
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+    }
+
+    function makeNonStreamingRequest(body: unknown, authHeader = 'Bearer test-key') {
+      return fetch(`${baseUrl}/v1/proxy/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: authHeader },
+        body: JSON.stringify(body)
+      })
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url instanceof Request ? url.url : url.toString()
+      if (urlStr === OPENAI_URL) {
+        return {
+          ok: true,
+          status: 200,
+          clone: () => ({ json: () => Promise.resolve(mockNonStreamingResponse) }),
+          json: () => Promise.resolve(mockNonStreamingResponse)
+        } as Response
+      }
+      return originalFetch(url, init)
+    }))
+
+    const res = await makeNonStreamingRequest({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual(mockNonStreamingResponse)
+    expect(res.headers.get('content-type')).toBe('application/json')
+
+    const tracesRes = await fetch(`${baseUrl}/api/traces`)
+    const tracesBody = (await tracesRes.json()) as { data: Array<{ spans: Array<{ name: string; attributes: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number; totalCost?: number } }> }>; pagination: { total: number } }
+    const proxyTrace = tracesBody.data.find((t) => t.spans.some((s) => s.name === 'llm-call'))
+    expect(proxyTrace).toBeDefined()
+    expect(proxyTrace?.spans[0]?.attributes?.['streaming']).toBeUndefined()
+  })
+})
+
 describe('OpenAI Responses API proxy', () => {
   const mockResponsesResponse = {
     id: 'resp_test',

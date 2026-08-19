@@ -463,7 +463,10 @@ app.post('/v1/proxy/chat/completions', async (c) => {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
 
+  const isStreaming = body.stream === true
   const startTime = new Date().toISOString()
+
+  // Build upstream request
   const requestInit: RequestInit = {
     method: 'POST',
     headers: {
@@ -500,57 +503,218 @@ app.post('/v1/proxy/chat/completions', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    model?: string
-    usage?: {
-      prompt_tokens?: number
-      completion_tokens?: number
-      total_tokens?: number
-    }
-  }
-
-  const model = typeof responseBody.model === 'string' ? responseBody.model : 'unknown'
-  const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
-  const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
-  const totalTokens = typeof responseBody.usage?.total_tokens === 'number' ? responseBody.usage.total_tokens : promptTokens + completionTokens
-
-  const inputCostPerToken = 2.50 / 1_000_000
-  const outputCostPerToken = 10.00 / 1_000_000
-  const totalCost = promptTokens * inputCostPerToken + completionTokens * outputCostPerToken
-
-  const trace: Trace = {
-    name: 'proxy-chat-completions',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: {
-          'llm.model': model,
-          'proxy.upstream': 'openai',
-          'http.status': response.status
-        },
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          totalCost
-        }
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      model?: string
+      usage?: {
+        prompt_tokens?: number
+        completion_tokens?: number
+        total_tokens?: number
       }
-    ]
+    }
+
+    const model = typeof responseBody.model === 'string' ? responseBody.model : 'unknown'
+    const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
+    const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
+    const totalTokens = typeof responseBody.usage?.total_tokens === 'number' ? responseBody.usage.total_tokens : promptTokens + completionTokens
+
+    const inputCostPerToken = 2.50 / 1_000_000
+    const outputCostPerToken = 10.00 / 1_000_000
+    const totalCost = promptTokens * inputCostPerToken + completionTokens * outputCostPerToken
+
+    const trace: Trace = {
+      name: 'proxy-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: {
+            'llm.model': model,
+            'proxy.upstream': 'openai',
+            'http.status': response.status
+          },
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: forward SSE chunks and aggregate usage on completion
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'openai'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  // Stream transformer to parse SSE and extract final usage
+  let accumulatedPromptTokens = 0
+  let accumulatedCompletionTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed === 'data: [DONE]') {
+              streamCompleted = true
+              continue
+            }
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from first chunk
+                if (typeof chunk.model === 'string' && finalModel === 'unknown') {
+                  finalModel = chunk.model
+                }
+                // Accumulate usage from chunks (OpenAI sends usage in final chunk)
+                if (chunk.usage) {
+                  if (typeof chunk.usage.prompt_tokens === 'number') {
+                    accumulatedPromptTokens = chunk.usage.prompt_tokens
+                  }
+                  if (typeof chunk.usage.completion_tokens === 'number') {
+                    accumulatedCompletionTokens = chunk.usage.completion_tokens
+                  }
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalTokens = accumulatedPromptTokens + accumulatedCompletionTokens
+        const inputCostPerToken = 2.50 / 1_000_000
+        const outputCostPerToken = 10.00 / 1_000_000
+        const totalCost = accumulatedPromptTokens * inputCostPerToken + accumulatedCompletionTokens * outputCostPerToken
+
+        const trace: Trace = {
+          name: 'proxy-chat-completions',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: {
+                'llm.model': finalModel,
+                'proxy.upstream': 'openai',
+                'http.status': response.status,
+                'streaming': true
+              },
+              usage: {
+                promptTokens: accumulatedPromptTokens,
+                completionTokens: accumulatedCompletionTokens,
+                totalTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-chat-completions',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'openai'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -567,14 +731,18 @@ app.post('/v1/proxy/anthropic/messages', async (c) => {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
 
+  const isStreaming = body.stream === true
   const startTime = new Date().toISOString()
+
+  const requestHeaders: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': ANTHROPIC_API_VERSION
+  }
+
   const requestInit: RequestInit = {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_API_VERSION
-    },
+    headers: requestHeaders,
     body: JSON.stringify(body)
   }
 
@@ -605,54 +773,211 @@ app.post('/v1/proxy/anthropic/messages', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    model?: string
-    usage?: {
-      input_tokens?: number
-      output_tokens?: number
-    }
-  }
-
-  const model = typeof responseBody.model === 'string' ? responseBody.model : 'unknown'
-  const inputTokens = typeof responseBody.usage?.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
-  const outputTokens = typeof responseBody.usage?.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
-
-  const totalCostCents = pricingEngine.calculateCostCents(inputTokens, outputTokens, model)
-  const totalCost = totalCostCents / 100
-
-  const trace: Trace = {
-    name: 'proxy-anthropic-messages',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: {
-          'llm.model': model,
-          'proxy.upstream': 'anthropic',
-          'http.status': response.status
-        },
-        usage: {
-          promptTokens: inputTokens,
-          completionTokens: outputTokens,
-          totalTokens: inputTokens + outputTokens,
-          totalCost
-        }
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      model?: string
+      usage?: {
+        input_tokens?: number
+        output_tokens?: number
       }
-    ]
+    }
+
+    const model = typeof responseBody.model === 'string' ? responseBody.model : 'unknown'
+    const inputTokens = typeof responseBody.usage?.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
+    const outputTokens = typeof responseBody.usage?.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
+
+    const totalCostCents = pricingEngine.calculateCostCents(inputTokens, outputTokens, model)
+    const totalCost = totalCostCents / 100
+
+    const trace: Trace = {
+      name: 'proxy-anthropic-messages',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: {
+            'llm.model': model,
+            'proxy.upstream': 'anthropic',
+            'http.status': response.status
+          },
+          usage: {
+            promptTokens: inputTokens,
+            completionTokens: outputTokens,
+            totalTokens: inputTokens + outputTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: forward SSE chunks and aggregate usage on completion
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-anthropic-messages',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'anthropic'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedInputTokens = 0
+  let accumulatedOutputTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from message_start event
+                if (chunk.type === 'message_start' && chunk.message?.model) {
+                  finalModel = chunk.message.model
+                }
+                // Extract usage from message_delta or final chunk
+                if (chunk.usage) {
+                  if (typeof chunk.usage.input_tokens === 'number') {
+                    accumulatedInputTokens = chunk.usage.input_tokens
+                  }
+                  if (typeof chunk.usage.output_tokens === 'number') {
+                    accumulatedOutputTokens = chunk.usage.output_tokens
+                  }
+                }
+                // Check for completion
+                if (chunk.type === 'message_delta' && chunk.delta?.stop_reason) {
+                  streamCompleted = true
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedInputTokens, accumulatedOutputTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        const trace: Trace = {
+          name: 'proxy-anthropic-messages',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: {
+                'llm.model': finalModel,
+                'proxy.upstream': 'anthropic',
+                'http.status': response.status,
+                'streaming': true
+              },
+              usage: {
+                promptTokens: accumulatedInputTokens,
+                completionTokens: accumulatedOutputTokens,
+                totalTokens: accumulatedInputTokens + accumulatedOutputTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-anthropic-messages',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'anthropic'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -669,9 +994,11 @@ app.post('/v1/proxy/gemini/generateContent', async (c) => {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
 
+  const isStreaming = body.stream === true
+
   // Extract model from request body (Google format: models/{model}:generateContent)
   const model = typeof body.model === 'string' ? body.model : 'gemini-1.5-pro'
-  const geminiUrl = `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`
+  const geminiUrl = `${GEMINI_BASE_URL}/${model}:${isStreaming ? 'streamGenerateContent' : 'generateContent'}?key=${encodeURIComponent(apiKey)}`
 
   const startTime = new Date().toISOString()
   const requestInit: RequestInit = {
@@ -713,60 +1040,217 @@ app.post('/v1/proxy/gemini/generateContent', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    candidates?: Array<{
-      content?: {
-        parts?: Array<{ text?: string }>
-      }
-    }>
-    usageMetadata?: {
-      promptTokenCount?: number
-      candidatesTokenCount?: number
-      totalTokenCount?: number
-    }
-    modelVersion?: string
-  }
-
-  const modelName = typeof responseBody.modelVersion === 'string' ? responseBody.modelVersion : 'unknown'
-  const promptTokens = typeof responseBody.usageMetadata?.promptTokenCount === 'number' ? responseBody.usageMetadata.promptTokenCount : 0
-  const completionTokens = typeof responseBody.usageMetadata?.candidatesTokenCount === 'number' ? responseBody.usageMetadata.candidatesTokenCount : 0
-
-  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, modelName)
-  const totalCost = totalCostCents / 100
-
-  const trace: Trace = {
-    name: 'proxy-gemini-generateContent',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: {
-          'llm.model': modelName,
-          'proxy.upstream': 'google',
-          'http.status': response.status
-        },
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          totalCost
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{ text?: string }>
         }
+      }>
+      usageMetadata?: {
+        promptTokenCount?: number
+        candidatesTokenCount?: number
+        totalTokenCount?: number
       }
-    ]
+      modelVersion?: string
+    }
+
+    const modelName = typeof responseBody.modelVersion === 'string' ? responseBody.modelVersion : 'unknown'
+    const promptTokens = typeof responseBody.usageMetadata?.promptTokenCount === 'number' ? responseBody.usageMetadata.promptTokenCount : 0
+    const completionTokens = typeof responseBody.usageMetadata?.candidatesTokenCount === 'number' ? responseBody.usageMetadata.candidatesTokenCount : 0
+
+    const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, modelName)
+    const totalCost = totalCostCents / 100
+
+    const trace: Trace = {
+      name: 'proxy-gemini-generateContent',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: {
+            'llm.model': modelName,
+            'proxy.upstream': 'google',
+            'http.status': response.status
+          },
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: forward SSE chunks (Gemini uses a different SSE format)
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-gemini-generateContent',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'google'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedPromptTokens = 0
+  let accumulatedCompletionTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model version from first chunk
+                if (chunk.modelVersion && finalModel === 'unknown') {
+                  finalModel = chunk.modelVersion
+                }
+                // Accumulate usage from usageMetadata
+                if (chunk.usageMetadata) {
+                  if (typeof chunk.usageMetadata.promptTokenCount === 'number') {
+                    accumulatedPromptTokens = chunk.usageMetadata.promptTokenCount
+                  }
+                  if (typeof chunk.usageMetadata.candidatesTokenCount === 'number') {
+                    accumulatedCompletionTokens = chunk.usageMetadata.candidatesTokenCount
+                  }
+                }
+                // Check for completion (no more candidates or finish_reason)
+                if (chunk.candidates && chunk.candidates.some((c: any) => c.finishReason)) {
+                  streamCompleted = true
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedPromptTokens, accumulatedCompletionTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        const trace: Trace = {
+          name: 'proxy-gemini-generateContent',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: {
+                'llm.model': finalModel,
+                'proxy.upstream': 'google',
+                'http.status': response.status,
+                'streaming': true
+              },
+              usage: {
+                promptTokens: accumulatedPromptTokens,
+                completionTokens: accumulatedCompletionTokens,
+                totalTokens: accumulatedPromptTokens + accumulatedCompletionTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-gemini-generateContent',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'google'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -782,6 +1266,7 @@ app.post('/v1/proxy/cohere/v1/chat', async (c) => {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
 
+  const isStreaming = body.stream === true
   const startTime = new Date().toISOString()
   const requestInit: RequestInit = {
     method: 'POST',
@@ -819,62 +1304,219 @@ app.post('/v1/proxy/cohere/v1/chat', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    text?: string
-    generationId?: string
-    meta?: {
-      tokens?: {
-        inputTokens?: number
-        outputTokens?: number
-      }
-    }
-    model?: string
-  }
-
-  const requestModel = typeof body.model === 'string' ? body.model : undefined
-  const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
-  const model = response.ok
-    ? (responseModel ?? requestModel ?? 'command-r-plus')
-    : 'unknown'
-  const promptTokens = typeof responseBody.meta?.tokens?.inputTokens === 'number' ? responseBody.meta.tokens.inputTokens : 0
-  const completionTokens = typeof responseBody.meta?.tokens?.outputTokens === 'number' ? responseBody.meta.tokens.outputTokens : 0
-
-  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
-  const totalCost = totalCostCents / 100
-
-  const trace: Trace = {
-    name: 'proxy-cohere-chat',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: {
-          'llm.model': model,
-          'proxy.upstream': 'cohere',
-          'http.status': response.status
-        },
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          totalCost
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      text?: string
+      generationId?: string
+      meta?: {
+        tokens?: {
+          inputTokens?: number
+          outputTokens?: number
         }
       }
-    ]
+      model?: string
+    }
+
+    const requestModel = typeof body.model === 'string' ? body.model : undefined
+    const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
+    const model = response.ok
+      ? (responseModel ?? requestModel ?? 'command-r-plus')
+      : 'unknown'
+    const promptTokens = typeof responseBody.meta?.tokens?.inputTokens === 'number' ? responseBody.meta.tokens.inputTokens : 0
+    const completionTokens = typeof responseBody.meta?.tokens?.outputTokens === 'number' ? responseBody.meta.tokens.outputTokens : 0
+
+    const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+    const totalCost = totalCostCents / 100
+
+    const trace: Trace = {
+      name: 'proxy-cohere-chat',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: {
+            'llm.model': model,
+            'proxy.upstream': 'cohere',
+            'http.status': response.status
+          },
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: Cohere uses SSE format
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-cohere-chat',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'cohere'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedPromptTokens = 0
+  let accumulatedCompletionTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from first chunk
+                if (chunk.model && finalModel === 'unknown') {
+                  finalModel = chunk.model
+                }
+                // Accumulate usage from meta.tokens
+                if (chunk.meta?.tokens) {
+                  if (typeof chunk.meta.tokens.inputTokens === 'number') {
+                    accumulatedPromptTokens = chunk.meta.tokens.inputTokens
+                  }
+                  if (typeof chunk.meta.tokens.outputTokens === 'number') {
+                    accumulatedCompletionTokens = chunk.meta.tokens.outputTokens
+                  }
+                }
+                // Check for completion
+                if (chunk.finishReason || chunk.is_finished) {
+                  streamCompleted = true
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedPromptTokens, accumulatedCompletionTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        const trace: Trace = {
+          name: 'proxy-cohere-chat',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: {
+                'llm.model': finalModel,
+                'proxy.upstream': 'cohere',
+                'http.status': response.status,
+                'streaming': true
+              },
+              usage: {
+                promptTokens: accumulatedPromptTokens,
+                completionTokens: accumulatedCompletionTokens,
+                totalTokens: accumulatedPromptTokens + accumulatedCompletionTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-cohere-chat',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'cohere'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -891,6 +1533,7 @@ app.post('/v1/proxy/mistral/v1/chat/completions', async (c) => {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
 
+  const isStreaming = body.stream === true
   const startTime = new Date().toISOString()
   const requestInit: RequestInit = {
     method: 'POST',
@@ -928,59 +1571,217 @@ app.post('/v1/proxy/mistral/v1/chat/completions', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    model?: string
-    usage?: {
-      prompt_tokens?: number
-      completion_tokens?: number
-      total_tokens?: number
-    }
-  }
-
-  const requestModel = typeof body.model === 'string' ? body.model : undefined
-  const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
-  const model = response.ok
-    ? (responseModel ?? requestModel ?? 'mistral-large-latest')
-    : 'unknown'
-  const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
-  const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
-
-  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
-  const totalCost = totalCostCents / 100
-
-  const trace: Trace = {
-    name: 'proxy-mistral-chat-completions',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: {
-          'llm.model': model,
-          'proxy.upstream': 'mistral',
-          'http.status': response.status
-        },
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          totalCost
-        }
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      model?: string
+      usage?: {
+        prompt_tokens?: number
+        completion_tokens?: number
+        total_tokens?: number
       }
-    ]
+    }
+
+    const requestModel = typeof body.model === 'string' ? body.model : undefined
+    const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
+    const model = response.ok
+      ? (responseModel ?? requestModel ?? 'mistral-large-latest')
+      : 'unknown'
+    const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
+    const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
+
+    const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+    const totalCost = totalCostCents / 100
+
+    const trace: Trace = {
+      name: 'proxy-mistral-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: {
+            'llm.model': model,
+            'proxy.upstream': 'mistral',
+            'http.status': response.status
+          },
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: Mistral uses OpenAI-compatible SSE format
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-mistral-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'mistral'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedPromptTokens = 0
+  let accumulatedCompletionTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed === 'data: [DONE]') {
+              streamCompleted = true
+              continue
+            }
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from first chunk
+                if (typeof chunk.model === 'string' && finalModel === 'unknown') {
+                  finalModel = chunk.model
+                }
+                // Accumulate usage from chunks (Mistral sends usage in final chunk)
+                if (chunk.usage) {
+                  if (typeof chunk.usage.prompt_tokens === 'number') {
+                    accumulatedPromptTokens = chunk.usage.prompt_tokens
+                  }
+                  if (typeof chunk.usage.completion_tokens === 'number') {
+                    accumulatedCompletionTokens = chunk.usage.completion_tokens
+                  }
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedPromptTokens, accumulatedCompletionTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        const trace: Trace = {
+          name: 'proxy-mistral-chat-completions',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: {
+                'llm.model': finalModel,
+                'proxy.upstream': 'mistral',
+                'http.status': response.status,
+                'streaming': true
+              },
+              usage: {
+                promptTokens: accumulatedPromptTokens,
+                completionTokens: accumulatedCompletionTokens,
+                totalTokens: accumulatedPromptTokens + accumulatedCompletionTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-mistral-chat-completions',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'mistral'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -997,6 +1798,7 @@ app.post('/v1/proxy/responses', async (c) => {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
 
+  const isStreaming = body.stream === true
   const startTime = new Date().toISOString()
   const requestInit: RequestInit = {
     method: 'POST',
@@ -1034,73 +1836,247 @@ app.post('/v1/proxy/responses', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    id?: string
-    model?: string
-    usage?: {
-      input_tokens?: number
-      output_tokens?: number
-      reasoning_tokens?: number
-      total_tokens?: number
-    }
-  }
-
-  const isError = !response.ok
-  const model = isError ? 'unknown' : (typeof responseBody.model === 'string' ? responseBody.model : 'unknown')
-  const responseId = typeof responseBody.id === 'string' ? responseBody.id : undefined
-  const inputTokens = typeof responseBody.usage?.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
-  const outputTokens = typeof responseBody.usage?.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
-  const reasoningTokens = typeof responseBody.usage?.reasoning_tokens === 'number' ? responseBody.usage.reasoning_tokens : 0
-
-  // OpenAI Responses API: total_tokens = input_tokens + output_tokens (reasoning_tokens included in output)
-  const totalTokens = typeof responseBody.usage?.total_tokens === 'number'
-    ? responseBody.usage.total_tokens
-    : inputTokens + outputTokens
-
-  const totalCostCents = pricingEngine.calculateCostCents(inputTokens, outputTokens, model)
-  const totalCost = totalCostCents / 100
-
-  const traceAttributes: Record<string, unknown> = {
-    'llm.model': model,
-    'proxy.upstream': 'openai-responses',
-    'http.status': response.status
-  }
-  if (responseId) {
-    traceAttributes['openai.response_id'] = responseId
-  }
-  if (reasoningTokens > 0) {
-    traceAttributes['llm.usage.reasoning_tokens'] = reasoningTokens
-  }
-
-  const trace: Trace = {
-    name: 'proxy-openai-responses',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: traceAttributes,
-        usage: {
-          promptTokens: inputTokens,
-          completionTokens: outputTokens,
-          totalTokens: inputTokens + outputTokens,
-          totalCost
-        }
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      id?: string
+      model?: string
+      usage?: {
+        input_tokens?: number
+        output_tokens?: number
+        reasoning_tokens?: number
+        total_tokens?: number
       }
-    ]
+    }
+
+    const isError = !response.ok
+    const model = isError ? 'unknown' : (typeof responseBody.model === 'string' ? responseBody.model : 'unknown')
+    const responseId = typeof responseBody.id === 'string' ? responseBody.id : undefined
+    const inputTokens = typeof responseBody.usage?.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
+    const outputTokens = typeof responseBody.usage?.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
+    const reasoningTokens = typeof responseBody.usage?.reasoning_tokens === 'number' ? responseBody.usage.reasoning_tokens : 0
+
+    // OpenAI Responses API: total_tokens = input_tokens + output_tokens (reasoning_tokens included in output)
+    const totalTokens = typeof responseBody.usage?.total_tokens === 'number'
+      ? responseBody.usage.total_tokens
+      : inputTokens + outputTokens
+
+    const totalCostCents = pricingEngine.calculateCostCents(inputTokens, outputTokens, model)
+    const totalCost = totalCostCents / 100
+
+    const traceAttributes: Record<string, unknown> = {
+      'llm.model': model,
+      'proxy.upstream': 'openai-responses',
+      'http.status': response.status
+    }
+    if (responseId) {
+      traceAttributes['openai.response_id'] = responseId
+    }
+    if (reasoningTokens > 0) {
+      traceAttributes['llm.usage.reasoning_tokens'] = reasoningTokens
+    }
+
+    const trace: Trace = {
+      name: 'proxy-openai-responses',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: traceAttributes,
+          usage: {
+            promptTokens: inputTokens,
+            completionTokens: outputTokens,
+            totalTokens: inputTokens + outputTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: OpenAI Responses API uses SSE format
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-openai-responses',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'openai-responses'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedInputTokens = 0
+  let accumulatedOutputTokens = 0
+  let accumulatedReasoningTokens = 0
+  let finalModel = 'unknown'
+  let finalResponseId: string | undefined
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from first chunk
+                if (typeof chunk.model === 'string' && finalModel === 'unknown') {
+                  finalModel = chunk.model
+                }
+                // Extract response ID
+                if (typeof chunk.id === 'string' && !finalResponseId) {
+                  finalResponseId = chunk.id
+                }
+                // Accumulate usage from chunks
+                if (chunk.usage) {
+                  if (typeof chunk.usage.input_tokens === 'number') {
+                    accumulatedInputTokens = chunk.usage.input_tokens
+                  }
+                  if (typeof chunk.usage.output_tokens === 'number') {
+                    accumulatedOutputTokens = chunk.usage.output_tokens
+                  }
+                  if (typeof chunk.usage.reasoning_tokens === 'number') {
+                    accumulatedReasoningTokens = chunk.usage.reasoning_tokens
+                  }
+                }
+                // Check for completion
+                if (chunk.status === 'completed' || chunk.status === 'failed' || chunk.status === 'cancelled') {
+                  streamCompleted = true
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedInputTokens, accumulatedOutputTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        const traceAttributes: Record<string, unknown> = {
+          'llm.model': finalModel,
+          'proxy.upstream': 'openai-responses',
+          'http.status': response.status,
+          'streaming': true
+        }
+        if (finalResponseId) {
+          traceAttributes['openai.response_id'] = finalResponseId
+        }
+        if (accumulatedReasoningTokens > 0) {
+          traceAttributes['llm.usage.reasoning_tokens'] = accumulatedReasoningTokens
+        }
+
+        const trace: Trace = {
+          name: 'proxy-openai-responses',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: traceAttributes,
+              usage: {
+                promptTokens: accumulatedInputTokens,
+                completionTokens: accumulatedOutputTokens,
+                totalTokens: accumulatedInputTokens + accumulatedOutputTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-openai-responses',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'openai-responses'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -1131,6 +2107,8 @@ app.post('/v1/proxy/azure/chat/completions', async (c) => {
   if (body === null) {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
+
+  const isStreaming = body.stream === true
 
   // Construct Azure OpenAI endpoint URL
   const azureUrl = `https://${resource}.${AZURE_BASE_HOST}/openai/deployments/${deployment}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`
@@ -1179,59 +2157,217 @@ app.post('/v1/proxy/azure/chat/completions', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    model?: string
-    usage?: {
-      prompt_tokens?: number
-      completion_tokens?: number
-      total_tokens?: number
-    }
-  }
-
-  const requestModel = typeof body.model === 'string' ? body.model : undefined
-  const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
-  const model = response.ok
-    ? (responseModel ?? requestModel ?? 'gpt-4o')
-    : 'unknown'
-  const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
-  const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
-
-  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
-  const totalCost = totalCostCents / 100
-
-  const trace: Trace = {
-    name: 'proxy-azure-chat-completions',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: {
-          'llm.model': model,
-          'proxy.upstream': 'azure-openai',
-          'http.status': response.status
-        },
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          totalCost
-        }
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      model?: string
+      usage?: {
+        prompt_tokens?: number
+        completion_tokens?: number
+        total_tokens?: number
       }
-    ]
+    }
+
+    const requestModel = typeof body.model === 'string' ? body.model : undefined
+    const responseModel = typeof responseBody.model === 'string' ? responseBody.model : undefined
+    const model = response.ok
+      ? (responseModel ?? requestModel ?? 'gpt-4o')
+      : 'unknown'
+    const promptTokens = typeof responseBody.usage?.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
+    const completionTokens = typeof responseBody.usage?.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
+
+    const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+    const totalCost = totalCostCents / 100
+
+    const trace: Trace = {
+      name: 'proxy-azure-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: {
+            'llm.model': model,
+            'proxy.upstream': 'azure-openai',
+            'http.status': response.status
+          },
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: Azure OpenAI uses OpenAI-compatible SSE format
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-azure-chat-completions',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'azure-openai'
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedPromptTokens = 0
+  let accumulatedCompletionTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed === 'data: [DONE]') {
+              streamCompleted = true
+              continue
+            }
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from first chunk
+                if (typeof chunk.model === 'string' && finalModel === 'unknown') {
+                  finalModel = chunk.model
+                }
+                // Accumulate usage from chunks (Azure OpenAI sends usage in final chunk)
+                if (chunk.usage) {
+                  if (typeof chunk.usage.prompt_tokens === 'number') {
+                    accumulatedPromptTokens = chunk.usage.prompt_tokens
+                  }
+                  if (typeof chunk.usage.completion_tokens === 'number') {
+                    accumulatedCompletionTokens = chunk.usage.completion_tokens
+                  }
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedPromptTokens, accumulatedCompletionTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        const trace: Trace = {
+          name: 'proxy-azure-chat-completions',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: {
+                'llm.model': finalModel,
+                'proxy.upstream': 'azure-openai',
+                'http.status': response.status,
+                'streaming': true
+              },
+              usage: {
+                promptTokens: accumulatedPromptTokens,
+                completionTokens: accumulatedCompletionTokens,
+                totalTokens: accumulatedPromptTokens + accumulatedCompletionTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-azure-chat-completions',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'azure-openai'
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
@@ -1267,6 +2403,8 @@ app.post('/v1/proxy/passthrough/**', async (c) => {
   if (body === null) {
     return c.json({ error: 'invalid JSON body' }, 400)
   }
+
+  const isStreaming = body.stream === true
 
   // Extract headers to pass through
   const requestHeaders: Record<string, string> = {
@@ -1318,97 +2456,287 @@ app.post('/v1/proxy/passthrough/**', async (c) => {
     return c.json({ error: 'upstream request failed' }, 502)
   }
 
-  const endTime = new Date().toISOString()
-  const responseBody = (await response.clone().json().catch(() => ({}))) as {
-    model?: string
-    usage?: {
-      prompt_tokens?: number
-      completion_tokens?: number
-      total_tokens?: number
-      input_tokens?: number
-      output_tokens?: number
-    }
-    meta?: {
-      tokens?: {
-        inputTokens?: number
-        outputTokens?: number
+  // Non-streaming: keep existing behavior
+  if (!isStreaming) {
+    const endTime = new Date().toISOString()
+    const responseBody = (await response.clone().json().catch(() => ({}))) as {
+      model?: string
+      usage?: {
+        prompt_tokens?: number
+        completion_tokens?: number
+        total_tokens?: number
+        input_tokens?: number
+        output_tokens?: number
       }
-    }
-    usageMetadata?: {
-      promptTokenCount?: number
-      candidatesTokenCount?: number
-      totalTokenCount?: number
-    }
-    modelVersion?: string
-  }
-
-  const isError = !response.ok
-  const model = isError ? 'unknown' : detectModelFromBody(body, hostname)
-  let promptTokens = 0
-  let completionTokens = 0
-
-  // Extract token usage from various provider response formats (only for successful responses)
-  if (!isError && responseBody.usage) {
-    // OpenAI/OpenAI-compatible format (prompt_tokens, completion_tokens)
-    if (typeof responseBody.usage.prompt_tokens === 'number' || typeof responseBody.usage.completion_tokens === 'number') {
-      promptTokens = typeof responseBody.usage.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
-      completionTokens = typeof responseBody.usage.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
-    }
-    // Anthropic format (input_tokens, output_tokens)
-    else if (typeof responseBody.usage.input_tokens === 'number' || typeof responseBody.usage.output_tokens === 'number') {
-      promptTokens = typeof responseBody.usage.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
-      completionTokens = typeof responseBody.usage.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
-    }
-  } else if (!isError && responseBody.meta?.tokens) {
-    // Cohere format
-    promptTokens = typeof responseBody.meta.tokens.inputTokens === 'number' ? responseBody.meta.tokens.inputTokens : 0
-    completionTokens = typeof responseBody.meta.tokens.outputTokens === 'number' ? responseBody.meta.tokens.outputTokens : 0
-  } else if (!isError && responseBody.usageMetadata) {
-    // Google Gemini format
-    promptTokens = typeof responseBody.usageMetadata.promptTokenCount === 'number' ? responseBody.usageMetadata.promptTokenCount : 0
-    completionTokens = typeof responseBody.usageMetadata.candidatesTokenCount === 'number' ? responseBody.usageMetadata.candidatesTokenCount : 0
-  }
-
-  // Calculate cost using pricing engine (falls back to default rates for unknown models)
-  const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
-  const totalCost = totalCostCents / 100
-
-  // Build trace attributes (excluding sensitive headers)
-  const traceAttributes: Record<string, unknown> = {
-    'llm.model': model,
-    'proxy.upstream': 'generic-passthrough',
-    'proxy.upstream.host': hostname,
-    'http.status': response.status
-  }
-
-  const trace: Trace = {
-    name: 'proxy-generic-passthrough',
-    startTime,
-    endTime,
-    spans: [
-      {
-        id: crypto.randomUUID(),
-        name: 'llm-call',
-        startTime,
-        endTime,
-        status: response.ok ? 'ok' : 'error',
-        attributes: traceAttributes,
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens: promptTokens + completionTokens,
-          totalCost
+      meta?: {
+        tokens?: {
+          inputTokens?: number
+          outputTokens?: number
         }
       }
-    ]
+      usageMetadata?: {
+        promptTokenCount?: number
+        candidatesTokenCount?: number
+        totalTokenCount?: number
+      }
+      modelVersion?: string
+    }
+
+    const isError = !response.ok
+    const model = isError ? 'unknown' : detectModelFromBody(body, hostname)
+    let promptTokens = 0
+    let completionTokens = 0
+
+    // Extract token usage from various provider response formats (only for successful responses)
+    if (!isError && responseBody.usage) {
+      // OpenAI/OpenAI-compatible format (prompt_tokens, completion_tokens)
+      if (typeof responseBody.usage.prompt_tokens === 'number' || typeof responseBody.usage.completion_tokens === 'number') {
+        promptTokens = typeof responseBody.usage.prompt_tokens === 'number' ? responseBody.usage.prompt_tokens : 0
+        completionTokens = typeof responseBody.usage.completion_tokens === 'number' ? responseBody.usage.completion_tokens : 0
+      }
+      // Anthropic format (input_tokens, output_tokens)
+      else if (typeof responseBody.usage.input_tokens === 'number' || typeof responseBody.usage.output_tokens === 'number') {
+        promptTokens = typeof responseBody.usage.input_tokens === 'number' ? responseBody.usage.input_tokens : 0
+        completionTokens = typeof responseBody.usage.output_tokens === 'number' ? responseBody.usage.output_tokens : 0
+      }
+    } else if (!isError && responseBody.meta?.tokens) {
+      // Cohere format
+      promptTokens = typeof responseBody.meta.tokens.inputTokens === 'number' ? responseBody.meta.tokens.inputTokens : 0
+      completionTokens = typeof responseBody.meta.tokens.outputTokens === 'number' ? responseBody.meta.tokens.outputTokens : 0
+    } else if (!isError && responseBody.usageMetadata) {
+      // Google Gemini format
+      promptTokens = typeof responseBody.usageMetadata.promptTokenCount === 'number' ? responseBody.usageMetadata.promptTokenCount : 0
+      completionTokens = typeof responseBody.usageMetadata.candidatesTokenCount === 'number' ? responseBody.usageMetadata.candidatesTokenCount : 0
+    }
+
+    // Calculate cost using pricing engine (falls back to default rates for unknown models)
+    const totalCostCents = pricingEngine.calculateCostCents(promptTokens, completionTokens, model)
+    const totalCost = totalCostCents / 100
+
+    // Build trace attributes (excluding sensitive headers)
+    const traceAttributes: Record<string, unknown> = {
+      'llm.model': model,
+      'proxy.upstream': 'generic-passthrough',
+      'proxy.upstream.host': hostname,
+      'http.status': response.status
+    }
+
+    const trace: Trace = {
+      name: 'proxy-generic-passthrough',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-call',
+          startTime,
+          endTime,
+          status: response.ok ? 'ok' : 'error',
+          attributes: traceAttributes,
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            totalCost
+          }
+        }
+      ]
+    }
+
+    store.add(trace)
+
+    return new Response(JSON.stringify(responseBody), {
+      status: response.status,
+      headers: {
+        'content-type': 'application/json'
+      }
+    })
   }
 
-  store.add(trace)
+  // Streaming: forward SSE chunks for generic passthrough
+  if (!response.body) {
+    const endTime = new Date().toISOString()
+    const errorTrace: Trace = {
+      name: 'proxy-generic-passthrough',
+      startTime,
+      endTime,
+      spans: [
+        {
+          id: crypto.randomUUID(),
+          name: 'llm-proxy',
+          startTime,
+          endTime,
+          status: 'error',
+          attributes: {
+            'error.message': 'upstream returned empty body',
+            'proxy.upstream': 'generic-passthrough',
+            'proxy.upstream.host': hostname
+          }
+        }
+      ]
+    }
+    store.add(errorTrace)
+    return c.json({ error: 'upstream returned empty body' }, 502)
+  }
 
-  return new Response(JSON.stringify(responseBody), {
+  let accumulatedPromptTokens = 0
+  let accumulatedCompletionTokens = 0
+  let finalModel = 'unknown'
+  let streamCompleted = false
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || trimmed.startsWith(':')) continue
+
+            if (trimmed === 'data: [DONE]') {
+              streamCompleted = true
+              continue
+            }
+
+            if (trimmed.startsWith('data: ')) {
+              const data = trimmed.slice(6)
+              try {
+                const chunk = JSON.parse(data)
+                // Extract model from first chunk
+                if (typeof chunk.model === 'string' && finalModel === 'unknown') {
+                  finalModel = chunk.model
+                }
+                // Try to extract usage from various formats
+                if (chunk.usage) {
+                  // OpenAI/OpenAI-compatible format
+                  if (typeof chunk.usage.prompt_tokens === 'number') {
+                    accumulatedPromptTokens = chunk.usage.prompt_tokens
+                  }
+                  if (typeof chunk.usage.completion_tokens === 'number') {
+                    accumulatedCompletionTokens = chunk.usage.completion_tokens
+                  }
+                  // Anthropic format
+                  if (typeof chunk.usage.input_tokens === 'number') {
+                    accumulatedPromptTokens = chunk.usage.input_tokens
+                  }
+                  if (typeof chunk.usage.output_tokens === 'number') {
+                    accumulatedCompletionTokens = chunk.usage.output_tokens
+                  }
+                }
+                // Cohere format
+                if (chunk.meta?.tokens) {
+                  if (typeof chunk.meta.tokens.inputTokens === 'number') {
+                    accumulatedPromptTokens = chunk.meta.tokens.inputTokens
+                  }
+                  if (typeof chunk.meta.tokens.outputTokens === 'number') {
+                    accumulatedCompletionTokens = chunk.meta.tokens.outputTokens
+                  }
+                }
+                // Google format
+                if (chunk.usageMetadata) {
+                  if (typeof chunk.usageMetadata.promptTokenCount === 'number') {
+                    accumulatedPromptTokens = chunk.usageMetadata.promptTokenCount
+                  }
+                  if (typeof chunk.usageMetadata.candidatesTokenCount === 'number') {
+                    accumulatedCompletionTokens = chunk.usageMetadata.candidatesTokenCount
+                  }
+                }
+              } catch {
+                // Ignore parse errors, forward raw
+              }
+            }
+
+            // Forward the line to client
+            controller.enqueue(new TextEncoder().encode(line + '\n\n'))
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          controller.enqueue(new TextEncoder().encode(buffer + '\n\n'))
+        }
+
+        // Create trace on stream completion
+        const endTime = new Date().toISOString()
+        const totalCostCents = pricingEngine.calculateCostCents(accumulatedPromptTokens, accumulatedCompletionTokens, finalModel)
+        const totalCost = totalCostCents / 100
+
+        // Build trace attributes (excluding sensitive headers)
+        const traceAttributes: Record<string, unknown> = {
+          'llm.model': finalModel,
+          'proxy.upstream': 'generic-passthrough',
+          'proxy.upstream.host': hostname,
+          'http.status': response.status,
+          'streaming': true
+        }
+
+        const trace: Trace = {
+          name: 'proxy-generic-passthrough',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-call',
+              startTime,
+              endTime,
+              status: response.ok && streamCompleted ? 'ok' : 'error',
+              attributes: traceAttributes,
+              usage: {
+                promptTokens: accumulatedPromptTokens,
+                completionTokens: accumulatedCompletionTokens,
+                totalTokens: accumulatedPromptTokens + accumulatedCompletionTokens,
+                totalCost
+              }
+            }
+          ]
+        }
+
+        store.add(trace)
+        controller.close()
+      } catch (err) {
+        const endTime = new Date().toISOString()
+        const errorTrace: Trace = {
+          name: 'proxy-generic-passthrough',
+          startTime,
+          endTime,
+          spans: [
+            {
+              id: crypto.randomUUID(),
+              name: 'llm-proxy',
+              startTime,
+              endTime,
+              status: 'error',
+              attributes: {
+                'error.message': err instanceof Error ? err.message : 'stream error',
+                'proxy.upstream': 'generic-passthrough',
+                'proxy.upstream.host': hostname
+              }
+            }
+          ]
+        }
+        store.add(errorTrace)
+        controller.error(err)
+      }
+    }
+  })
+
+  return new Response(stream, {
     status: response.status,
     headers: {
-      'content-type': 'application/json'
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
     }
   })
 })
