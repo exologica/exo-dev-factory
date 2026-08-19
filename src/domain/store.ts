@@ -3,6 +3,8 @@ import Database from 'better-sqlite3'
 import type { Trace, TraceStatus } from './trace.js'
 import { traceStatus, traceTotalPromptTokens, traceTotalCompletionTokens } from './trace.js'
 import { pricingEngine } from './pricing.js'
+import { parseFilterExpression, type FilterExpr } from './filter-parser.js'
+import { evaluateFilter, evaluateFilterBatch } from './filter-evaluator.js'
 
 export interface TraceStoreOptions {
   /**
@@ -33,6 +35,10 @@ export interface TraceListOptions {
   startTimeLte?: string
   /** Sort field and direction: 'startTime:asc' | 'startTime:desc' | 'durationMs:asc' | 'durationMs:desc' | 'name:asc' | 'name:desc' */
   sort?: string
+  /** Expression filter DSL (e.g., 'status:error AND duration_ms>1000') */
+  filter?: string
+  /** Pre-parsed filter AST (for internal use, avoids re-parsing) */
+  filterAst?: FilterExpr
 }
 
 /**
@@ -183,8 +189,14 @@ export class TraceStore {
 
     let sql = `SELECT data FROM traces${whereClause} ORDER BY ${orderBy}`
     if (options.limit !== undefined || options.offset !== undefined) {
+      // When filterAst is provided, we need to fetch more records to ensure
+      // filtered results are accurate, since filter is applied post-SQL.
+      // Use a higher limit (default 1000) when filterAst is present.
+      const effectiveLimit = options.filterAst
+        ? (options.limit ?? 1000)
+        : (options.limit ?? -1)
       sql += ' LIMIT ?'
-      params.push(options.limit ?? -1)
+      params.push(effectiveLimit)
       if (options.offset !== undefined) {
         sql += ' OFFSET ?'
         params.push(options.offset)
@@ -200,6 +212,11 @@ export class TraceStore {
         const bDur = b.spans[0] ? Date.parse(b.spans[0].endTime) - Date.parse(b.spans[0].startTime) : 0
         return direction === 'asc' ? aDur - bDur : bDur - aDur
       })
+    }
+
+    // Apply expression filter if provided (post-SQL filtering for complex DSL)
+    if (options.filterAst) {
+      traces = evaluateFilterBatch(options.filterAst, traces)
     }
 
     return traces
@@ -238,9 +255,17 @@ export class TraceStore {
     }
 
     const whereClause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''
-    const sql = `SELECT COUNT(*) AS n FROM traces${whereClause}`
-    const row = this.db.prepare(sql).all(...params) as Array<{ n: number }>
-    return row[0]?.n ?? 0
+    let sql = `SELECT COUNT(*) AS n FROM traces${whereClause}`
+    let row = this.db.prepare(sql).all(...params) as Array<{ n: number }>
+    let count = row[0]?.n ?? 0
+
+    // If expression filter is provided, we need to fetch and filter in memory for accurate count
+    if (options.filterAst && count > 0) {
+      const filtered = this.list({ ...options, limit: count, offset: 0 })
+      count = filtered.length
+    }
+
+    return count
   }
 
   get(id: string): Trace | undefined {

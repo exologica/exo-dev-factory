@@ -2400,3 +2400,293 @@ describe('Generic passthrough proxy', () => {
     expect(proxyTrace?.spans[0]?.usage?.completionTokens).toBe(6)
   })
 })
+
+describe('trace API expression filter', () => {
+  // Use future timestamps (year 2099) to ensure these traces sort first in startTime:desc order,
+  // since the shared test database contains many traces from earlier tests with recent timestamps.
+  const baseTime = '2099-01-01T00:00:00.000Z'
+  let timeOffset = 0
+  function nextTime(): string {
+    const t = new Date(Date.parse(baseTime) + timeOffset)
+    timeOffset += 1000 // 1 second increments
+    return t.toISOString()
+  }
+
+  function seedTrace(
+    startTime: string,
+    name: string,
+    spanStatus: 'ok' | 'error' = 'ok',
+    options?: { sessionId?: string; userId?: string; attributes?: Record<string, unknown>; usage?: { promptTokens: number; completionTokens: number } }
+  ) {
+    return fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        startTime,
+        endTime: new Date(Date.parse(startTime) + 1000).toISOString(),
+        sessionId: options?.sessionId,
+        userId: options?.userId,
+        spans: [
+          {
+            id: `span-${name}`,
+            name: 'llm-call',
+            startTime,
+            endTime: new Date(Date.parse(startTime) + 500).toISOString(),
+            status: spanStatus,
+            attributes: options?.attributes,
+            usage: options?.usage
+          }
+        ]
+      })
+    })
+  }
+
+  function makeFilterUrl(filter: string) {
+    const params = new URLSearchParams()
+    params.set('filter', filter)
+    return `${baseUrl}/api/traces?${params.toString()}`
+  }
+
+  it('filters by status:error using expression filter', async () => {
+    const prefix = 'filter-status-error-'
+    await seedTrace(nextTime(), prefix + 'ok-filtered')
+    await seedTrace(nextTime(), prefix + 'err-a', 'error')
+    await seedTrace(nextTime(), prefix + 'err-b', 'error')
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=status:error AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(2)
+    expect(body.data.map((t) => t.name).sort()).toEqual([prefix + 'err-a', prefix + 'err-b'])
+    expect(body.pagination.total).toBe(2)
+  })
+
+  it('filters by duration_ms comparison', async () => {
+    const prefix = 'filter-duration-'
+    // Create short trace (100ms duration) and long trace (1000ms duration) manually
+    // to avoid seedTrace's fixed 1000ms duration
+    const shortStart = nextTime()
+    await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: prefix + 'short',
+        startTime: shortStart,
+        endTime: new Date(Date.parse(shortStart) + 100).toISOString(), // 100ms trace duration
+        spans: [{
+          id: `span-${prefix}short`,
+          name: 'llm-call',
+          startTime: shortStart,
+          endTime: new Date(Date.parse(shortStart) + 50).toISOString(),
+          status: 'ok'
+        }]
+      })
+    })
+    const longStart = nextTime()
+    await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: prefix + 'long',
+        startTime: longStart,
+        endTime: new Date(Date.parse(longStart) + 1000).toISOString(), // 1000ms trace duration
+        spans: [{
+          id: `span-${prefix}long`,
+          name: 'llm-call',
+          startTime: longStart,
+          endTime: new Date(Date.parse(longStart) + 500).toISOString(),
+          status: 'ok'
+        }]
+      })
+    })
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=duration_ms>500 AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'long')
+  })
+
+  it('filters by name contains (:)', async () => {
+    const prefix = 'filter-name-contains-'
+    await seedTrace(nextTime(), prefix + 'chat-service')
+    await seedTrace(nextTime(), prefix + 'api-service')
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=name:chat AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'chat-service')
+  })
+
+  it('filters by name not contains (!~)', async () => {
+    const prefix = 'filter-name-not-contains-'
+    await seedTrace(nextTime(), prefix + 'chat-service')
+    await seedTrace(nextTime(), prefix + 'api-service')
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=name!~chat AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'api-service')
+  })
+
+  it('filters by sessionId', async () => {
+    const prefix = 'filter-session-'
+    await seedTrace(nextTime(), prefix + 'trace-a', 'ok', { sessionId: 'session-123' })
+    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { sessionId: 'session-456' })
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=sessionId:session-123 AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'trace-a')
+  })
+
+  it('filters by userId', async () => {
+    const prefix = 'filter-user-'
+    await seedTrace(nextTime(), prefix + 'trace-a', 'ok', { userId: 'user-123' })
+    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { userId: 'user-456' })
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=userId:user-123 AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'trace-a')
+  })
+
+  it('filters by span.name', async () => {
+    const prefix = 'filter-span-name-'
+    // Set span name directly (not via attributes) since evaluator checks span.name field
+    await fetch(`${baseUrl}/api/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: prefix + 'trace-a',
+        startTime: nextTime(),
+        endTime: new Date(Date.parse(nextTime()) + 1000).toISOString(),
+        spans: [{
+          id: `span-${prefix}trace-a`,
+          name: 'custom-span',
+          startTime: nextTime(),
+          endTime: new Date(Date.parse(nextTime()) + 500).toISOString(),
+          status: 'ok'
+        }]
+      })
+    })
+    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { attributes: { 'span.name': 'other-span' } })
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=span.name:custom-span AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'trace-a')
+  })
+
+  it('filters by span.attributes', async () => {
+    const prefix = 'filter-span-attrs-'
+    await seedTrace(nextTime(), prefix + 'trace-a', 'ok', { attributes: { 'llm.model': 'gpt-4o' } })
+    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { attributes: { 'llm.model': 'claude-3' } })
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=span.attributes.llm.model:gpt-4o AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'trace-a')
+  })
+
+  it('combines filter with discrete params (AND semantics)', async () => {
+    const prefix = 'filter-combine-'
+    await seedTrace(nextTime(), prefix + 'chat-service', 'error', { sessionId: 'session-123' })
+    await seedTrace(nextTime(), prefix + 'chat-service', 'ok', { sessionId: 'session-123' })
+    await seedTrace(nextTime(), prefix + 'api-service', 'error', { sessionId: 'session-456' })
+
+    // filter=status:error AND serviceName=chat (discrete param)
+    const res = await fetch(`${baseUrl}/api/traces?filter=status:error&serviceName=${prefix}chat-service`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'chat-service')
+  })
+
+  it('handles AND logic', async () => {
+    const prefix = 'filter-and-'
+    await seedTrace(nextTime(), prefix + 'chat-service', 'error')
+    await seedTrace(nextTime(), prefix + 'chat-service', 'ok')
+    await seedTrace(nextTime(), prefix + 'api-service', 'error')
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=name:chat AND status:error AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'chat-service')
+  })
+
+  it('handles OR logic', async () => {
+    const prefix = 'filter-or-'
+    await seedTrace(nextTime(), prefix + 'chat-service', 'ok')
+    await seedTrace(nextTime(), prefix + 'api-service', 'ok')
+    await seedTrace(nextTime(), prefix + 'other-service', 'ok')
+
+    // Parentheses needed: (name:chat OR name:api) AND name:prefix
+    // Without parentheses, AND binds tighter: name:chat OR (name:api AND name:prefix)
+    const res = await fetch(`${baseUrl}/api/traces?filter=(name:chat OR name:api) AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(2)
+    expect(body.data.map((t) => t.name).sort()).toEqual([prefix + 'api-service', prefix + 'chat-service'])
+  })
+
+  it('handles NOT logic', async () => {
+    const prefix = 'filter-not-'
+    await seedTrace(nextTime(), prefix + 'chat-service', 'error')
+    await seedTrace(nextTime(), prefix + 'api-service', 'ok')
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=NOT status:error AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'api-service')
+  })
+
+  it('handles grouped expressions with parentheses', async () => {
+    const prefix = 'filter-group-'
+    await seedTrace(nextTime(), prefix + 'chat-service', 'error')
+    await seedTrace(nextTime(), prefix + 'api-service', 'error')
+    await seedTrace(nextTime(), prefix + 'chat-service', 'ok')
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=(name:chat OR name:api) AND status:error AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(2)
+    expect(body.data.map((t) => t.name).sort()).toEqual([prefix + 'api-service', prefix + 'chat-service'])
+  })
+
+  it('returns 400 for invalid filter expression', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?filter=invalid expression`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string; details: string[] }
+    expect(body.error).toBe('invalid filter expression')
+    expect(body.details).toBeDefined()
+  })
+
+  it('returns 400 for malformed filter syntax', async () => {
+    const res = await fetch(`${baseUrl}/api/traces?filter=status:`)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string; details: string[] }
+    expect(body.error).toBe('invalid filter expression')
+  })
+
+  it('filters by usage.promptTokens', async () => {
+    const prefix = 'filter-usage-'
+    await seedTrace(nextTime(), prefix + 'trace-a', 'ok', { usage: { promptTokens: 100, completionTokens: 10 } })
+    await seedTrace(nextTime(), prefix + 'trace-b', 'ok', { usage: { promptTokens: 50, completionTokens: 5 } })
+
+    const res = await fetch(`${baseUrl}/api/traces?filter=usage.promptTokens>75 AND name:${prefix}`)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { name: string }[]; pagination: { total: number } }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]?.name).toBe(prefix + 'trace-a')
+  })
+})

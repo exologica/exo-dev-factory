@@ -8,6 +8,7 @@ import { z } from 'zod'
 import { TraceStore } from '../domain/store.js'
 import type { Trace, TraceStatus } from '../domain/trace.js'
 import { pricingEngine } from '../domain/pricing.js'
+import { parseFilterExpression, type FilterExpr } from '../domain/filter-parser.js'
 
 // Anthropic API constants
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
@@ -217,7 +218,9 @@ const listQuerySchema = z.object({
       'name:desc'
     ])
     .optional()
-    .catch(undefined)
+    .catch(undefined),
+  // Expression filter DSL (e.g., 'status:error AND duration_ms>1000')
+  filter: z.string().max(2000).optional().catch(undefined)
 })
 
 function validatePaginationParams(query: Record<string, string | undefined>): { error: string } | null {
@@ -263,10 +266,21 @@ app.get('/api/traces', (c) => {
     return c.json({ error: validationError.error }, 400)
   }
 
-const parsed = listQuerySchema.parse(query)
+  const parsed = listQuerySchema.parse(query)
   const page = parsed.page ?? 1
   const limit = parsed.limit ?? DEFAULT_TRACE_LIST_LIMIT
   const offset = parsed.offset ?? (page - 1) * limit
+
+  // Parse filter expression if provided
+  let filterAst: FilterExpr | undefined
+  if (parsed.filter) {
+    console.log("DEBUG: parsed.filter =", JSON.stringify(parsed.filter));
+    const parseResult = parseFilterExpression(parsed.filter)
+    if (parseResult.errors.length > 0) {
+      return c.json({ error: 'invalid filter expression', details: parseResult.errors }, 400)
+    }
+    filterAst = parseResult.ast ?? undefined
+  }
 
   const listOptions: {
     limit: number
@@ -279,6 +293,7 @@ const parsed = listQuerySchema.parse(query)
     startTimeGte?: string
     startTimeLte?: string
     sort?: string
+    filterAst?: FilterExpr
   } = {
     limit,
     offset,
@@ -289,7 +304,8 @@ const parsed = listQuerySchema.parse(query)
     operationName: parsed.operationName,
     startTimeGte: parsed.startTimeGte,
     startTimeLte: parsed.startTimeLte,
-    sort: parsed.sort
+    sort: parsed.sort,
+    filterAst
   }
 
   const data = store.list(listOptions)
