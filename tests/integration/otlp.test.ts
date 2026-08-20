@@ -288,6 +288,64 @@ describe('OTLP /v1/traces endpoint', () => {
     expect(res.status).toBe(400)
   })
 
+  it('returns 400 for out-of-range span timestamps instead of 500', async () => {
+    // Exact reproduction payload from issue #77: 28-digit endTimeUnixNano
+    // previously escaped the handler as an unhandled RangeError (500).
+    const invalidRequest = {
+      resourceSpans: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'svc' } }] },
+          scopeSpans: [
+            {
+              scope: { name: 's' },
+              spans: [
+                {
+                  traceId: '0af7651916cd43dd8448eb211c80319c',
+                  spanId: 'b7ad6b7169203331',
+                  name: 'x',
+                  startTimeUnixNano: '1787181900000000000',
+                  endTimeUnixNano: '1787181900000000000200000000',
+                  status: { code: 1 }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+    const res = await fetch(`${baseUrl}/v1/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(invalidRequest)
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string; details: Array<{ path: (string | number)[]; message: string }> }
+    expect(body.error).toBe('invalid OTLP payload')
+    expect(body.details.some(d => d.path.includes('endTimeUnixNano'))).toBe(true)
+  })
+
+  it('returns 400 for non-integer span timestamp strings', async () => {
+    const invalidRequest = {
+      resourceSpans: [
+        {
+          scopeSpans: [
+            {
+              spans: [
+                { traceId: '00000000000000000000000000000001', spanId: '0000000000000001', name: 'x', startTimeUnixNano: 'not-a-number', endTimeUnixNano: '1', status: {} }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+    const res = await fetch(`${baseUrl}/v1/traces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(invalidRequest)
+    })
+    expect(res.status).toBe(400)
+  })
+
   it('returns 413 for payload exceeding 10MB', async () => {
     // Create a request with a large payload (over 10MB)
     const largeRequest = {
