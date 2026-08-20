@@ -27,6 +27,27 @@ export const otlpSpanStatusSchema = z.object({
   code: z.number().int().optional() // 0=UNSET, 1=OK, 2=ERROR
 }).optional()
 
+// JavaScript's Date is only defined over +/-8.64e15 ms, so the representable
+// range for integer Unix nanosecond timestamp strings is +/-8.64e24 ns.
+const OTLP_TIMESTAMP_MIN_NANO = -8640000000000000n * 1_000_000n
+const OTLP_TIMESTAMP_MAX_NANO = 8640000000000000n * 1_000_000n
+
+/** Integer Unix nanosecond timestamp string within the representable Date range. */
+export const otlpNanoTimestampSchema = z.string().refine(
+  (value) => {
+    // BigInt('') and whitespace-only strings coerce to 0n; reject them explicitly.
+    if (value.trim() === '') return false
+    let nanos: bigint
+    try {
+      nanos = BigInt(value)
+    } catch {
+      return false
+    }
+    return nanos >= OTLP_TIMESTAMP_MIN_NANO && nanos <= OTLP_TIMESTAMP_MAX_NANO
+  },
+  { message: 'must be an integer nanosecond timestamp within the representable date range' }
+)
+
 export const otlpSpanSchema = z.object({
   traceId: z.string().length(32), // 16 bytes hex
   spanId: z.string().length(16),  // 8 bytes hex
@@ -34,8 +55,8 @@ export const otlpSpanSchema = z.object({
   parentSpanId: z.string().length(16).optional(),
   name: z.string().min(1),
   kind: z.number().int().optional(), // SpanKind: 0=UNSPECIFIED, 1=INTERNAL, 2=SERVER, 3=CLIENT, 4=PRODUCER, 5=CONSUMER
-  startTimeUnixNano: z.string(),
-  endTimeUnixNano: z.string(),
+  startTimeUnixNano: otlpNanoTimestampSchema,
+  endTimeUnixNano: otlpNanoTimestampSchema,
   attributes: z.array(otlpAttributeSchema).optional(),
   droppedAttributesCount: z.number().int().nonnegative().optional(),
   events: z.array(otlpEventSchema).optional(),

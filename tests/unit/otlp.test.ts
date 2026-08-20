@@ -6,7 +6,8 @@ import {
   otlpAttributesToRecord,
   mapOtlpSpanToSpan,
   mapOtlpToTraces,
-  parseOtlpTracesRequest
+  parseOtlpTracesRequest,
+  otlpNanoTimestampSchema
 } from '../../src/domain/otlp.js'
 
 const validOtlpRequest = {
@@ -143,6 +144,32 @@ describe('otlpNanoToIso', () => {
   it('handles sub-millisecond precision', () => {
     const result = otlpNanoToIso('1723833600123456789')
     expect(result).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  })
+})
+
+describe('otlpNanoTimestampSchema', () => {
+  it('accepts a valid 19-digit nanosecond timestamp', () => {
+    expect(otlpNanoTimestampSchema.safeParse('1723833600000000000').success).toBe(true)
+  })
+
+  it('accepts boundary values at the representable Date range', () => {
+    expect(otlpNanoTimestampSchema.safeParse('8640000000000000000000').success).toBe(true)
+    expect(otlpNanoTimestampSchema.safeParse('-8640000000000000000000').success).toBe(true)
+  })
+
+  it('rejects out-of-range timestamps beyond the Date range', () => {
+    // 28-digit value from issue #77 reproduction
+    expect(otlpNanoTimestampSchema.safeParse('1787181900000000000200000000').success).toBe(false)
+    expect(otlpNanoTimestampSchema.safeParse('8640000000000000000001').success).toBe(false)
+    expect(otlpNanoTimestampSchema.safeParse('-8640000000000000000001').success).toBe(false)
+  })
+
+  it('rejects non-integer timestamp strings', () => {
+    expect(otlpNanoTimestampSchema.safeParse('abc').success).toBe(false)
+    expect(otlpNanoTimestampSchema.safeParse('1.5').success).toBe(false)
+    expect(otlpNanoTimestampSchema.safeParse('1e6').success).toBe(false)
+    expect(otlpNanoTimestampSchema.safeParse('').success).toBe(false)
+    expect(otlpNanoTimestampSchema.safeParse('  ').success).toBe(false)
   })
 })
 
@@ -501,5 +528,47 @@ describe('parseOtlpTracesRequest', () => {
     }
     const result = parseOtlpTracesRequest(request)
     expect(result.success).toBe(false)
+  })
+
+  it('rejects out-of-range span timestamps', () => {
+    const request = {
+      resourceSpans: [
+        {
+          scopeSpans: [
+            {
+              spans: [
+                { traceId: '00000000000000000000000000000001', spanId: '0000000000000001', name: 'x', startTimeUnixNano: '1787181900000000000200000000', endTimeUnixNano: '1723833605000000000', status: {} }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+    const result = parseOtlpTracesRequest(request)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.path.includes('startTimeUnixNano'))).toBe(true)
+    }
+  })
+
+  it('rejects non-integer span timestamp strings', () => {
+    const request = {
+      resourceSpans: [
+        {
+          scopeSpans: [
+            {
+              spans: [
+                { traceId: '00000000000000000000000000000001', spanId: '0000000000000001', name: 'x', startTimeUnixNano: '1723833600000000000', endTimeUnixNano: 'not-a-number', status: {} }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+    const result = parseOtlpTracesRequest(request)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.path.includes('endTimeUnixNano'))).toBe(true)
+    }
   })
 })
