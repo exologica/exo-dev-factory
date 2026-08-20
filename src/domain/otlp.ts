@@ -28,7 +28,7 @@ export const otlpSpanStatusSchema = z.object({
 }).optional()
 
 // JavaScript's Date is only defined over +/-8.64e15 ms, so the representable
-// range for integer Unix nanosecond timestamp strings is +/-8.64e24 ns.
+// range for integer Unix nanosecond timestamp strings is +/-8.64e21 ns.
 const OTLP_TIMESTAMP_MIN_NANO = -8640000000000000n * 1_000_000n
 const OTLP_TIMESTAMP_MAX_NANO = 8640000000000000n * 1_000_000n
 
